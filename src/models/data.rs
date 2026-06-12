@@ -1,7 +1,6 @@
 use serde::Serialize;
 use std::time::Instant;
 
-
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum CryptoExchange {
     Binance,
@@ -14,7 +13,7 @@ pub enum CryptoExchange {
 pub enum PositionType {
     Long,
     Short,
-    None
+    None,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,7 +29,7 @@ pub struct EquityPoint {
 pub enum Phase {
     BarClose,
     PostBuy,
-    PostSell
+    PostSell,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +54,8 @@ pub enum ExitReason {
     InitialStop,
     /// Hard percentage panic stop; bypasses min_bars_in_position and exits at the breach price.
     PanicStop,
+    /// Mean-reversion target: z-score reverted to the mean; exits at market price.
+    ReversionExit,
     TrailingStop,
     TakeProfit,
     WeakMomentumExit,
@@ -69,21 +70,23 @@ pub enum ExitReason {
 impl ExitReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            ExitReason::InitialStop       => "INITIAL_STOP",
-            ExitReason::PanicStop         => "PANIC_STOP",
-            ExitReason::TrailingStop      => "TRAILING_STOP",
-            ExitReason::TakeProfit        => "TAKE_PROFIT",
-            ExitReason::WeakMomentumExit  => "WEAK_MOMENTUM_EXIT",
-            ExitReason::BearishCross      => "BEARISH_CROSS",
-            ExitReason::ShortStop         => "SHORT_STOP",
-            ExitReason::ShortTakeProfit   => "SHORT_TAKE_PROFIT",
-            ExitReason::EndOfData         => "END_OF_DATA",
+            ExitReason::InitialStop => "INITIAL_STOP",
+            ExitReason::PanicStop => "PANIC_STOP",
+            ExitReason::ReversionExit => "REVERSION_EXIT",
+            ExitReason::TrailingStop => "TRAILING_STOP",
+            ExitReason::TakeProfit => "TAKE_PROFIT",
+            ExitReason::WeakMomentumExit => "WEAK_MOMENTUM_EXIT",
+            ExitReason::BearishCross => "BEARISH_CROSS",
+            ExitReason::ShortStop => "SHORT_STOP",
+            ExitReason::ShortTakeProfit => "SHORT_TAKE_PROFIT",
+            ExitReason::EndOfData => "END_OF_DATA",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SignalState {
+    pub z_score: f64,
     pub bullish_cross: bool,
     pub bearish_cross: bool,
     pub bullish_trend: bool,
@@ -128,7 +131,13 @@ pub struct CandleBuilder {
 
 impl CandleBuilder {
     pub fn new(price: f64) -> Self {
-        Self { open: price, high: price, low: price, close: price, start_time: Instant::now() }
+        Self {
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            start_time: Instant::now(),
+        }
     }
     pub fn update(&mut self, price: f64) {
         self.high = self.high.max(price);
