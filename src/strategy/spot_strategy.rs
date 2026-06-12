@@ -360,7 +360,10 @@ impl SpotStrategy {
             return Action::NoSignal;
         }
 
-        if self.is_holding_asset || in_cooldown || self.drawdown_stop_active {
+        // Long and short are mutually exclusive: never stack a long on top of an
+        // open short. Otherwise both legs share the single `current_equity`
+        // baseline and each leg's realised PnL absorbs the other's swings.
+        if self.is_holding_asset || self.is_short || in_cooldown || self.drawdown_stop_active {
             return Action::NoSignal;
         }
 
@@ -404,6 +407,11 @@ impl SpotStrategy {
         signal: &SignalState,
     ) -> Action {
         if !signal.short_entry {
+            return Action::NoSignal;
+        }
+
+        // Mutually exclusive with an open long (see try_enter_position).
+        if self.is_short || self.is_holding_asset || self.drawdown_stop_active {
             return Action::NoSignal;
         }
 

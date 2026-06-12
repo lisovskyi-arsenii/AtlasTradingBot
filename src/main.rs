@@ -168,11 +168,8 @@ async fn main() {
                 symbols_to_test = top_pairs;
             }
         } else {
-            // Інакше використовуємо жорсткий список
-            symbols_to_test = vec![
-                "BTCUSDT".to_string(), "ETHUSDT".to_string(), "SOLUSDT".to_string(),
-                "BNBUSDT".to_string(), "ADAUSDT".to_string(), "XRPUSDT".to_string()
-            ];
+            // Інакше використовуємо список з config (runtime.backtest_symbols)
+            symbols_to_test = config.runtime.backtest_symbols.clone();
         }
 
         let mut all_results = Vec::new();
