@@ -101,7 +101,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len { s.to_string() } else { format!("{}…", &s[..max_len - 1]) }
 }
 
-fn print_results_table(all_results: &[BacktestResult]) {
+fn print_results_table(all_results: &[BacktestResult], config: &BotConfig) {
     if all_results.is_empty() { return; }
 
     println!("\n╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
@@ -119,17 +119,19 @@ fn print_results_table(all_results: &[BacktestResult]) {
         );
     }
 
-    let total_initial = all_results.first().map(|r| r.initial_capital).unwrap_or(0.0);
-    let total_final: f64 = all_results.iter().map(|r| r.final_equity - r.initial_capital).sum::<f64>() + total_initial;
+    // Розрахунок підсумкових показників
+    let total_initial = config.margin * all_results.len() as f64;
     let total_pnl_usdt: f64 = all_results.iter().map(|r| r.total_pnl_usdt).sum();
-    let total_pnl_pct = if total_initial > 0.0 { ((total_final - total_initial) / total_initial) * 100.0 } else { 0.0 };
+    let total_final = total_initial + total_pnl_usdt;
+    let total_pnl_pct = if total_initial > 0.0 { (total_pnl_usdt / total_initial) * 100.0 } else { 0.0 };
+
     let total_trades: usize = all_results.iter().map(|r| r.total_trades).sum();
     let avg_win_rate = all_results.iter().map(|r| r.win_rate).sum::<f64>() / all_results.len() as f64;
     let avg_sharpe = all_results.iter().map(|r| r.sharpe_ratio).sum::<f64>() / all_results.len() as f64;
     let max_dd = all_results.iter().map(|r| r.max_drawdown_pct).fold(0.0_f64, f64::min);
 
-    println!("╠════════════════════╬══════════╬═══════╬════════════╬════════════╬════════════╬════════════╬════════════╬════════╬═══════════╣");
-    println!("║ TOTAL              ║          ║ {:>5} ║ {:>8.1}% ║          ║ {:>8.2}% ║ {:>8.2}% ║ {:>8.2} ║        ║           ║",
+    println!("╠════════════════════╬══════════╬═══════╬════════════╬════════════╬════════════╬════════════╬════════════╬════════╦═══════════╣");
+    println!("║ TOTAL              ║          ║ {:>5} ║ {:>8.1}% ║            ║ {:>8.2}% ║ {:>8.2}% ║ {:>8.2} ║        ║           ║",
              total_trades, avg_win_rate, total_pnl_pct, max_dd, avg_sharpe);
     println!("╚════════════════════╩══════════╩═══════╩════════════╩════════════╩════════════╩════════════╩════════════╩════════╩═══════════╝\n");
 
@@ -201,7 +203,7 @@ async fn main() {
         }
 
         // Виводимо фінальну таблицю з результатами
-        print_results_table(&all_results);
+        print_results_table(&all_results, &config);
         return;
     }
 

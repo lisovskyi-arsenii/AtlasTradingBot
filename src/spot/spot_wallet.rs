@@ -44,14 +44,14 @@ pub struct Wallet {
 impl Wallet {
     pub fn new(start_usdt: f64, exchange: CryptoExchange) -> Self {
         let (maker, taker) = match exchange {
-            CryptoExchange::Binance => (0.001, 0.001),     // 0.1% standard
-            CryptoExchange::Bybit => (0.001, 0.001),       // 0.1% spot
-            CryptoExchange::Whitebit => (0.001, 0.001),    // 0.1% standard
+            CryptoExchange::Binance  => (0.001, 0.001),
+            CryptoExchange::Bybit    => (0.001, 0.001),
+            CryptoExchange::Whitebit => (0.001, 0.001),
         };
 
         let slippage = match exchange {
-            CryptoExchange::Binance => 0.0001,   // 0.01% — high liquidity
-            CryptoExchange::Bybit => 0.00015,    // 0.015%
+            CryptoExchange::Binance  => 0.0001,  // 0.01% — high liquidity
+            CryptoExchange::Bybit    => 0.00015, // 0.015%
             CryptoExchange::Whitebit => 0.0003,  // 0.03% — lower liquidity
         };
 
@@ -72,12 +72,7 @@ impl Wallet {
     }
 
     fn effective_fee_pct(&self, is_maker: bool) -> f64 {
-        let base = if is_maker {
-            self.maker_fee_pct
-        } else {
-            self.taker_fee_pct
-        };
-
+        let base = if is_maker { self.maker_fee_pct } else { self.taker_fee_pct };
         if self.use_bnb_discount && self.exchange == CryptoExchange::Binance {
             base * 0.75
         } else {
@@ -86,51 +81,84 @@ impl Wallet {
     }
 
     fn floor_to_step(value: f64, step: f64) -> f64 {
-        if step <= 0.0 {
-            return value;
-        }
+        if step <= 0.0 { return value; }
         (value / step).floor() * step
     }
 
     fn ceil_to_tick(value: f64, tick: f64) -> f64 {
-        if tick <= 0.0 {
-            return value;
-        }
+        if tick <= 0.0 { return value; }
         (value / tick).ceil() * tick
     }
 
     fn floor_to_tick(value: f64, tick: f64) -> f64 {
-        if tick <= 0.0 {
-            return value;
-        }
+        if tick <= 0.0 { return value; }
         (value / tick).floor() * tick
     }
 
-    /// Realistic buy simulation with exchange-specific fees and slippage
-    // У файлі spot_wallet.rs, онови метод buy та sell_all
-    pub fn buy(&mut self, current_price: f64, usdt_amount: f64, _is_maker: bool) -> Option<f64> {
-        // У режимі імітації ми не перевіряємо жорстко баланс
-        // або дозволяємо гаманцю "йти в мінус" для тестування логіки
-        let executed_price = current_price * (1.0 + self.simulated_slippage_pct);
-        let qty = usdt_amount / executed_price;
+    /// Simulated buy with:
+    ///  - balance guard (returns None if insufficient funds)
+    ///  - upward slippage (taker fills at a slightly worse price)
+    ///  - tick rounding (ceil — conservative, never pay less than market)
+    ///  - fee deducted from received crypto
+    pub fn buy(&mut self, current_price: f64, usdt_amount: f64, is_maker: bool) -> Option<f64> {
+        // FIX: guard against over-spending — was silently going negative before
+        if usdt_amount > self.usdt_balance {
+            return None;
+        }
+        if usdt_amount <= 0.0 {
+            return None;
+        }
 
-        self.usdt_balance -= usdt_amount;
-        self.crypto_balance += qty;
+        // Slippage: buyer fills at a slightly higher price
+        let raw_price = current_price * (1.0 + self.simulated_slippage_pct);
 
-        println!("[WALLET] SIM-BUY: {} BTC @ ${:.2}", qty, executed_price);
+        // FIX: tick rounding restored so conservative fill tests pass
+        let executed_price = Self::ceil_to_tick(raw_price, self.filters.tick_size);
+
+        let fee_pct   = self.effective_fee_pct(is_maker);
+        let qty_gross = usdt_amount / executed_price;
+        let qty_net   = Self::floor_to_step(qty_gross * (1.0 - fee_pct), self.filters.step_size);
+
+        if qty_net * executed_price < self.filters.min_notional {
+            return None;
+        }
+
+        self.usdt_balance   -= usdt_amount;
+        self.crypto_balance += qty_net;
+
+        println!(
+            "[WALLET] SIM-BUY: {:.6} @ ${:.4}  fee={:.4}%",
+            qty_net, executed_price, fee_pct * 100.0
+        );
         Some(executed_price)
     }
 
-    pub fn sell_all(&mut self, current_price: f64, _is_maker: bool) -> Option<f64> {
-        if self.crypto_balance <= 0.0 { return None; }
+    /// Simulated sell-all with:
+    ///  - downward slippage
+    ///  - tick rounding (floor — conservative, never receive more than market)
+    ///  - fee deducted from received USDT
+    pub fn sell_all(&mut self, current_price: f64, is_maker: bool) -> Option<f64> {
+        if self.crypto_balance <= 0.0 {
+            return None;
+        }
 
-        let executed_price = current_price * (1.0 - self.simulated_slippage_pct);
-        let usdt_received = self.crypto_balance * executed_price;
+        // Slippage: seller fills at a slightly lower price
+        let raw_price = current_price * (1.0 - self.simulated_slippage_pct);
 
-        self.usdt_balance += usdt_received;
-        self.crypto_balance = 0.0;
+        // FIX: tick rounding restored
+        let executed_price = Self::floor_to_tick(raw_price, self.filters.tick_size);
 
-        println!("[WALLET] SIM-SELL: All @ ${:.2}. Received: ${:.2}", executed_price, usdt_received);
+        let fee_pct       = self.effective_fee_pct(is_maker);
+        let usdt_gross    = self.crypto_balance * executed_price;
+        let usdt_received = usdt_gross * (1.0 - fee_pct);
+
+        self.usdt_balance   += usdt_received;
+        self.crypto_balance  = 0.0;
+
+        println!(
+            "[WALLET] SIM-SELL: All @ ${:.4}  received ${:.2}  fee={:.4}%",
+            executed_price, usdt_received, fee_pct * 100.0
+        );
         Some(executed_price)
     }
 
@@ -138,19 +166,12 @@ impl Wallet {
         self.usdt_balance + self.crypto_balance * market_price
     }
 
+    #[allow(dead_code)]
     fn exchange_name(&self) -> &'static str {
         match self.exchange {
-            CryptoExchange::Binance => "BINANCE",
-            CryptoExchange::Bybit => "BYBIT",
+            CryptoExchange::Binance  => "BINANCE",
+            CryptoExchange::Bybit    => "BYBIT",
             CryptoExchange::Whitebit => "WHITEBIT",
-        }
-    }
-
-    fn symbol_name(&self) -> &'static str {
-        match self.exchange {
-            CryptoExchange::Binance => "BTC",
-            CryptoExchange::Bybit => "BTC",
-            CryptoExchange::Whitebit => "BTC",
         }
     }
 }
@@ -163,7 +184,10 @@ mod tests {
     fn buy_rounds_price_up_to_tick_for_conservative_fill() {
         let mut wallet = Wallet::new(1000.0, CryptoExchange::Binance);
         wallet.simulated_slippage_pct = 0.0;
+        wallet.maker_fee_pct = 0.0;
+        wallet.taker_fee_pct = 0.0;
 
+        // 100.004 → ceil to tick 0.01 → 100.01
         let executed_price = wallet.buy(100.004, 100.0, false).expect("buy should execute");
         assert_eq!(executed_price, 100.01);
     }
@@ -172,8 +196,12 @@ mod tests {
     fn sell_rounds_price_down_to_tick_for_conservative_fill() {
         let mut wallet = Wallet::new(1000.0, CryptoExchange::Binance);
         wallet.simulated_slippage_pct = 0.0;
+        wallet.maker_fee_pct = 0.0;
+        wallet.taker_fee_pct = 0.0;
 
         let _ = wallet.buy(100.00, 100.0, false).expect("buy should execute");
+
+        // 100.006 → floor to tick 0.01 → 100.00
         let executed_price = wallet.sell_all(100.006, false).expect("sell should execute");
         assert_eq!(executed_price, 100.00);
     }
@@ -196,6 +224,7 @@ mod tests {
         assert!(executed.is_some(), "Whitebit buy should work");
     }
 
+    /// FIX: buy_not_enough_balance — was silently going negative; now returns None
     #[test]
     fn buy_not_enough_balance() {
         let mut wallet = Wallet::new(100.0, CryptoExchange::Binance);
@@ -208,5 +237,19 @@ mod tests {
         let mut wallet = Wallet::new(1000.0, CryptoExchange::Binance);
         let result = wallet.sell_all(50000.0, false);
         assert!(result.is_none(), "Should not sell without crypto");
+    }
+
+    #[test]
+    fn round_trip_preserves_value_approximately() {
+        // buy then immediately sell at same price — only fees eaten
+        let mut wallet = Wallet::new(1000.0, CryptoExchange::Binance);
+        wallet.simulated_slippage_pct = 0.0;
+
+        wallet.buy(100.0, 500.0, false).unwrap();
+        wallet.sell_all(100.0, false).unwrap();
+
+        // 2 × 0.1% fee = ~0.2% loss
+        let total = wallet.total_value(100.0);
+        assert!(total > 998.0 && total < 1000.0, "Round-trip value: {}", total);
     }
 }

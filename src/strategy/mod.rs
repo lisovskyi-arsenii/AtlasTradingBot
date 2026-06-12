@@ -8,6 +8,11 @@ use ta::{DataItem, Next};
 pub mod spot_strategy;
 pub mod futures_strategy;
 
+/// Core interface shared by all strategy implementations.
+///
+/// Trait methods are intentionally minimal: each concrete strategy (Spot,
+/// Futures, …) implements `on_tick` and `on_candle_close` in its own `impl`
+/// block and calls `update_indicators` here for the shared TA bookkeeping.
 pub trait TradingStrategy {
     fn loop_count(&mut self) -> &mut usize;
     fn slow_sma(&mut self)   -> &mut Sma;
@@ -17,14 +22,24 @@ pub trait TradingStrategy {
     fn atr(&mut self)        -> &mut Atr;
     fn macro_ema(&mut self)  -> &mut Ema;
     fn vol_sma(&mut self)    -> &mut Sma;
-    fn warmup_period(&self) -> usize;
-    fn final_equity(&self, current_price: f64)  -> f64;
+    fn warmup_period(&self)  -> usize;
+    fn final_equity(&self, current_price: f64) -> f64;
     fn total_trades(&self) -> usize;
 
     fn on_tick(&mut self, current_price: f64);
     fn on_candle_close(&mut self, candle: &Candle);
 
-    fn update_indicators(&mut self, candle: Candle) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
+    /// Feed one closed candle through all indicators.
+    ///
+    /// Returns `None` during the warm-up period so callers can early-return
+    /// without acting on unreliable indicator values.
+    ///
+    /// Return order:
+    ///   `(slow_sma, fast_sma, trend_ema, rsi, atr, macro_ema, vol_sma)`
+    fn update_indicators(
+        &mut self,
+        candle: Candle,
+    ) -> Option<(f64, f64, f64, f64, f64, f64, f64)> {
         *self.loop_count() += 1;
 
         let slow_value    = f64::from(self.slow_sma().next(candle.close));
@@ -44,9 +59,13 @@ pub trait TradingStrategy {
             .expect("Failed to build DataItem");
         let atr_value = f64::from(self.atr().next(&item));
 
-        let warmup_period = self.warmup_period();
-        if *self.loop_count() < warmup_period {
-            println!("[Warming up indicators... Step {}/{}]", self.loop_count(), warmup_period);
+        let warmup = self.warmup_period();
+        if *self.loop_count() < warmup {
+            println!(
+                "[Warming up indicators… {}/{}]",
+                self.loop_count(),
+                warmup
+            );
             return None;
         }
 
