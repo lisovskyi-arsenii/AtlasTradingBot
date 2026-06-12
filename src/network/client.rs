@@ -1,49 +1,61 @@
-use crate::models::crypto_dto::CryptoPriceResult;
+// Re-exports of request DTOs so exchange-specific clients can import them via
+// `crate::network::client::...` (keeps existing import sites working).
 pub(crate) use crate::models::cryptocurrency::binance::BinancePriceRequest;
 pub(crate) use crate::models::cryptocurrency::bybit::BybitPriceRequest;
 pub(crate) use crate::models::cryptocurrency::whitebit::WhitebitPriceRequest;
-use crate::models::data::CryptoExchange;
-use reqwest::Client;
 
-const BINANCE_URL: &str = "https://api.binance.com/api/v3/ticker/price?symbol=";
-const BYBIT_URL: &str = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=";
-const WHITEBIT_URL: &str = "https://api.whitebit.com/v1/public/ticker?market=";
+// Small helper used by websocket clients: attempts to extract a price from a
+// JSON payload returned by various exchanges. It checks several common keys
+// and nested structures and returns Option<f64>.
+use serde_json::Value;
 
+pub fn parse_price_from_json(text: &str) -> Option<f64> {
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        // Try common numeric fields first
+        if let Some(p) = v.get("c").and_then(|x| x.as_f64()) {
+            return Some(p);
+        }
+        if let Some(s) = v.get("c").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            return Some(s);
+        }
 
-pub(crate) async fn fetch_raw_price(url: CryptoExchange, symbol: &str, client: &Client) -> Result<CryptoPriceResult, reqwest::Error> {
-    let base_url: &str = match url {
-        CryptoExchange::Binance => BINANCE_URL,
-        CryptoExchange::Bybit => BYBIT_URL,
-        CryptoExchange::Whitebit => WHITEBIT_URL
-    };
+        if let Some(p) = v.get("price").and_then(|x| x.as_f64()) {
+            return Some(p);
+        }
+        if let Some(s) = v.get("price").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            return Some(s);
+        }
 
-    let mut custom_url: String = base_url.to_owned();
-    custom_url.push_str(symbol);
+        // Whitebit/Bybit style keys
+        if let Some(s) = v.get("last_price").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            return Some(s);
+        }
+        if let Some(s) = v.get("lastPrice").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            return Some(s);
+        }
 
-    let response = client.get(custom_url).send().await?;
+        // Nested arrays / objects (e.g., Bybit result.list[0].last_price)
+        if let Some(arr) = v.get("result").and_then(|r| r.get("list")) {
+            if let Some(first) = arr.get(0) {
+                if let Some(s) = first.get("lastPrice").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                    return Some(s);
+                }
+                if let Some(s) = first.get("last_price").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                    return Some(s);
+                }
+            }
+        }
 
-    if !response.status().is_success() {
-        let status = response.status();
-        eprintln!("Server responded with error: {}", status);
-
-        let error = response.error_for_status().unwrap_err();
-        return Err(error)
+        if let Some(arr) = v.get("data").and_then(|d| d.get(0)) {
+            if let Some(s) = arr.get("lastPrice").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                return Some(s);
+            }
+            if let Some(s) = arr.get("last_price").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                return Some(s);
+            }
+        }
     }
 
-    let result: CryptoPriceResult = match url {
-        CryptoExchange::Binance => {
-            let request: BinancePriceRequest = response.json::<BinancePriceRequest>().await?;
-            request.into()
-        },
-        CryptoExchange::Bybit => {
-            let request: BybitPriceRequest = response.json::<BybitPriceRequest>().await?;
-            request.into()
-        },
-        CryptoExchange::Whitebit => {
-            let request: WhitebitPriceRequest = response.json::<WhitebitPriceRequest>().await?;
-            request.into()
-        }
-    };
-
-    Ok(result)
+    None
 }
+

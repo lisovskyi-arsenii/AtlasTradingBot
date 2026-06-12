@@ -1,33 +1,82 @@
-use crate::models::data::Action;
+use crate::models::data::{Action, Phase, PositionType};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CandleLogEntry {
+    pub bar_index: usize,
     pub timestamp: String,
     pub symbol: String,
+    pub phase: Phase,
 
     pub open: f64,
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    pub current_price: f64,
+
+    pub z_score: f64,
+    pub z_score_period: usize,
+    pub z_score_sma: f64,
+    pub z_score_std_dev: f64,
+    pub ema_value: f64,
+    pub ema_period: usize,
 
     pub fast_sma: f64,
     pub slow_sma: f64,
     pub trend_ema: f64,
+    pub macro_ema: f64,
+    pub vol_sma: f64,
     pub rsi: f64,
     pub atr: f64,
+    pub atr_pct: f64,
+    pub price_vs_sma_pct: f64,
+    pub price_vs_ema_pct: f64,
 
     pub bullish_cross: bool,
     pub bearish_cross: bool,
     pub bullish_trend: bool,
     pub bullish_rsi: bool,
+    pub strong_macro_trend: bool,
+    pub strong_volume: bool,
+    pub short_entry: bool,
+    pub bearish_trend: bool,
 
     pub fast_slow_diff: f64,
     pub price_trend_diff: f64,
 
+    pub position_type: PositionType,
     pub is_holding: bool,
+    pub is_short: bool,
+    pub is_drawdown_stop_active: bool,
+    pub in_cooldown: bool,
     pub cooldown_bars_remaining: usize,
+    pub short_cooldown_bars_remaining: usize,
+    pub bars_in_position: usize,
+
+    pub wallet_usdt_balance: f64,
+    pub wallet_crypto_balance: f64,
+    pub position_exposure_usdt: f64,
+    pub entry_equity: f64,
+    pub equity: f64,
+    pub realized_pnl_usdt: f64,
+    pub unrealized_pnl_usdt: f64,
+    pub unrealized_pnl_pct: f64,
+    pub pnl_usdt: f64,
+    pub pnl_pct: f64,
+    pub peak_equity: f64,
+    pub drawdown_pct: f64,
+    pub trade_count: usize,
+
+    pub buy_price: f64,
+    pub initial_stop_price: f64,
+    pub target_price: f64,
+    pub highest_price: f64,
+    pub short_entry_price: f64,
+    pub short_stop_price: f64,
+    pub short_tp_price: f64,
+    pub short_margin_usdt: f64,
 
     pub action: Action,
     pub no_signal_reason: String,
+    pub short_no_signal_reason: String,
 }

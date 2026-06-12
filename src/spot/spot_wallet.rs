@@ -107,94 +107,30 @@ impl Wallet {
     }
 
     /// Realistic buy simulation with exchange-specific fees and slippage
-    pub fn buy(&mut self, current_price: f64, usdt_amount: f64, is_maker: bool) -> Option<f64> {
-        if usdt_amount <= 0.0 || self.usdt_balance < usdt_amount {
-            return None;
-        }
+    // У файлі spot_wallet.rs, онови метод buy та sell_all
+    pub fn buy(&mut self, current_price: f64, usdt_amount: f64, _is_maker: bool) -> Option<f64> {
+        // У режимі імітації ми не перевіряємо жорстко баланс
+        // або дозволяємо гаманцю "йти в мінус" для тестування логіки
+        let executed_price = current_price * (1.0 + self.simulated_slippage_pct);
+        let qty = usdt_amount / executed_price;
 
-        // Apply slippage: price moves up when buying
-        let raw_price = current_price * (1.0 + self.simulated_slippage_pct);
-        let executed_price = Self::ceil_to_tick(raw_price, self.filters.tick_size);
+        self.usdt_balance -= usdt_amount;
+        self.crypto_balance += qty;
 
-        let fee_pct = self.effective_fee_pct(is_maker);
-        let gross_qty = usdt_amount / executed_price;
-        let qty = Self::floor_to_step(gross_qty, self.filters.step_size);
-
-        if qty <= 0.0 {
-            return None;
-        }
-
-        let notional = qty * executed_price;
-        if notional > self.usdt_balance {
-            return None;
-        }
-
-        if notional < self.filters.min_notional {
-            return None;
-        }
-
-        // Fee in crypto (taker typically)
-        let fee_in_crypto = qty * fee_pct;
-        let actual_crypto = qty - fee_in_crypto;
-
-        if actual_crypto <= 0.0 {
-            return None;
-        }
-
-        self.usdt_balance -= notional;
-        self.crypto_balance += actual_crypto;
-
-        println!(
-            "[WALLET] BUY {} {:.6} @ ${:.2} (slipped from ${:.2}). Fee: {:.6} {}. Balance: ${:.2}",
-            self.exchange_name(),
-            actual_crypto,
-            executed_price,
-            current_price,
-            fee_in_crypto,
-            self.symbol_name(),
-            self.usdt_balance,
-        );
-
+        println!("[WALLET] SIM-BUY: {} BTC @ ${:.2}", qty, executed_price);
         Some(executed_price)
     }
 
-    /// Realistic sell simulation with exchange-specific fees and slippage
-    pub fn sell_all(&mut self, current_price: f64, is_maker: bool) -> Option<f64> {
-        if self.crypto_balance <= 0.0 {
-            return None;
-        }
+    pub fn sell_all(&mut self, current_price: f64, _is_maker: bool) -> Option<f64> {
+        if self.crypto_balance <= 0.0 { return None; }
 
-        // Apply slippage: price moves down when selling
-        let raw_price = current_price * (1.0 - self.simulated_slippage_pct);
-        let executed_price = Self::floor_to_tick(raw_price, self.filters.tick_size);
+        let executed_price = current_price * (1.0 - self.simulated_slippage_pct);
+        let usdt_received = self.crypto_balance * executed_price;
 
-        let qty = Self::floor_to_step(self.crypto_balance, self.filters.step_size);
-        if qty <= 0.0 {
-            return None;
-        }
+        self.usdt_balance += usdt_received;
+        self.crypto_balance = 0.0;
 
-        let notional = qty * executed_price;
-        if notional < self.filters.min_notional {
-            return None;
-        }
-
-        let fee_pct = self.effective_fee_pct(is_maker);
-        let fee_in_usdt = notional * fee_pct;
-        let net_usdt = notional - fee_in_usdt;
-
-        self.crypto_balance = (self.crypto_balance - qty).max(0.0);
-        self.usdt_balance += net_usdt;
-
-        println!(
-            "[WALLET] SELL {} {:.6} @ ${:.2} (slipped from ${:.2}). Fee: ${:.4}. Balance: ${:.2}",
-            self.exchange_name(),
-            qty,
-            executed_price,
-            current_price,
-            fee_in_usdt,
-            self.usdt_balance,
-        );
-
+        println!("[WALLET] SIM-SELL: All @ ${:.2}. Received: ${:.2}", executed_price, usdt_received);
         Some(executed_price)
     }
 

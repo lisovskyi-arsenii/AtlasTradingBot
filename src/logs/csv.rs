@@ -1,14 +1,13 @@
 use crate::models::candle_log_entry::CandleLogEntry;
 use csv_async::AsyncWriterBuilder;
-// Змінено імпорт
 use std::error::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::BufWriter;
 
 pub async fn write_to_csv_file(
     candle_log_entry: &CandleLogEntry,
+    path: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let path = "trading_bot.csv";
 
     let should_write_header = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata.len() == 0,

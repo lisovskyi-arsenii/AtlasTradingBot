@@ -1,14 +1,6 @@
 use serde::Serialize;
 use std::time::Instant;
 
-pub const SLOW_PERIOD: usize = 30;
-pub const FAST_PERIOD: usize = 10;
-pub const TREND_PERIOD: usize = 50;
-pub const RSI_PERIOD: usize = 14;
-pub const ATR_PERIOD: usize = 14;
-pub const ADX_PERIOD: usize = 14;
-pub const MACRO_PERIOD: usize = 200;
-pub const VOL_SMA_PERIOD: usize = 20;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum CryptoExchange {
@@ -17,21 +9,24 @@ pub enum CryptoExchange {
     Whitebit,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PositionType {
     Long,
     Short,
     None
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct EquityPoint {
     pub bar_index: usize,
     pub equity: f64,
     pub phase: Phase,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Phase {
     BarClose,
     PostBuy,
@@ -41,15 +36,18 @@ pub enum Phase {
 #[derive(Debug, Clone)]
 pub enum Mode {
     Spot,
-    Futures
+    Futures,
 }
 
 #[derive(Debug, Copy, Clone, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Action {
     NoSignal,
     Buy,
     Sell,
-    StopHit
+    StopHit,
+    ShortSell,
+    CloseShort,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -59,18 +57,24 @@ pub enum ExitReason {
     TakeProfit,
     WeakMomentumExit,
     BearishCross,
+    /// Short: price rose to stop-loss
+    ShortStop,
+    /// Short: price fell to take-profit
+    ShortTakeProfit,
     EndOfData,
 }
 
 impl ExitReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            ExitReason::InitialStop => "INITIAL_STOP",
-            ExitReason::TrailingStop => "TRAILING_STOP",
-            ExitReason::TakeProfit => "TAKE_PROFIT",
-            ExitReason::WeakMomentumExit => "WEAK_MOMENTUM_EXIT",
-            ExitReason::BearishCross => "BEARISH_CROSS",
-            ExitReason::EndOfData => "END_OF_DATA",
+            ExitReason::InitialStop       => "INITIAL_STOP",
+            ExitReason::TrailingStop      => "TRAILING_STOP",
+            ExitReason::TakeProfit        => "TAKE_PROFIT",
+            ExitReason::WeakMomentumExit  => "WEAK_MOMENTUM_EXIT",
+            ExitReason::BearishCross      => "BEARISH_CROSS",
+            ExitReason::ShortStop         => "SHORT_STOP",
+            ExitReason::ShortTakeProfit   => "SHORT_TAKE_PROFIT",
+            ExitReason::EndOfData         => "END_OF_DATA",
         }
     }
 }
@@ -86,6 +90,10 @@ pub struct SignalState {
     pub fast_slow_diff: f64,
     pub price_trend_diff: f64,
     pub no_signal_reason: String,
+    // Short-side fields
+    pub short_entry: bool,
+    pub bearish_trend: bool,
+    pub short_no_signal_reason: String,
 }
 
 #[derive(Debug, Clone)]

@@ -1,0 +1,43 @@
+[bot]
+mode = "spot"
+exchange = "binance"
+symbol = "BTCUSDT"
+leverage = 10.0
+margin = 1000.0
+
+[strategy]
+# Indicator periods
+slow_period = 30
+fast_period = 10
+trend_period = 50
+rsi_period = 14
+atr_period = 14
+macro_period = 200
+vol_sma_period = 20
+z_score_period = 40
+ema_period = 200
+
+# Entry / exit thresholds
+z_entry = -1.0
+short_z_entry = 1.0
+atr_multiplier = 3.0
+short_stop_atr_mult = 2.0
+short_tp_atr_mult = 4.0
+take_profit_r_multiplier = 4.5
+min_profit_for_rsi_exit_pct = 0.004
+
+# Risk and cooldowns
+short_cooldown_bars = 4
+cooldown_bars = 2
+loss_cooldown_bars = 8
+take_profit_cooldown_bars = 3
+min_bars_in_position = 5
+default_risk_per_trade_pct = 0.0035
+max_strategy_drawdown_pct = 12.0
+
+[runtime]
+backtest_csv_path = "BTCUSDT-1h-2026-05.csv"
+live_log_path = "trading_bot.csv"
+candle_timeframe_seconds = 900
+poll_interval_seconds = 3
+

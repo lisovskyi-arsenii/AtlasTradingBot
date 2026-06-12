@@ -4,4 +4,6 @@ pub mod candle;
 pub mod cryptocurrency;
 pub mod trade;
 pub mod bot_config;
+pub mod strategy_config;
 pub mod candle_log_entry;
+pub mod log_level;
