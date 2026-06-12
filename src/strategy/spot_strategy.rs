@@ -56,6 +56,7 @@ pub struct SpotStrategy {
     pub last_rsi_value: f64,
     pub drawdown_stop_active: bool,
     pub initial_stop_price: f64,
+    pub panic_stop_price: f64,
     pub target_price: f64,
     pub price_history: VecDeque<f64>,
     pub ema_value: Option<f64>,
@@ -118,6 +119,7 @@ impl SpotStrategy {
             last_rsi_value: 0.0,
             drawdown_stop_active: false,
             initial_stop_price:   0.0,
+            panic_stop_price:     0.0,
             target_price:         0.0,
             price_history: VecDeque::with_capacity(config.warmup_period()),
             ema_value: None,
@@ -256,7 +258,7 @@ impl SpotStrategy {
             fast_slow_diff: 0.0,
             price_trend_diff: 0.0,
             no_signal_reason,
-            short_entry: !self.is_short && !self.is_holding_asset && bearish_cross && self.short_cooldown_bars == 0,
+            short_entry: self.config.enable_short && !self.is_short && !self.is_holding_asset && bearish_cross && self.short_cooldown_bars == 0,
             bearish_trend,
             short_no_signal_reason: if self.is_short { "SHORT_ACTIVE".into() } else { "SHORT_READY".into() },
         }
@@ -291,6 +293,11 @@ impl SpotStrategy {
             self.buy_price = executed_price;
             self.highest_price = executed_price;
             self.initial_stop_price = executed_price - stop_distance;
+            self.panic_stop_price = if self.config.panic_stop_loss_pct > 0.0 {
+                executed_price * (1.0 - self.config.panic_stop_loss_pct)
+            } else {
+                0.0
+            };
             self.target_price = executed_price + stop_distance * self.config.take_profit_r_multiplier;
             self.entry_equity = self.current_equity;
             self.bars_in_position = 0;
@@ -453,35 +460,41 @@ impl SpotStrategy {
     //     None
     // }
 
-    fn determine_exit_reason(&self, current_price: f64, _candle: Option<&Candle>, _signal: Option<&SignalState>) -> Option<ExitReason> {
-        if !self.is_holding_asset { return None; }
+    fn determine_exit_reason(&self, current_price: f64, candle: Option<&Candle>, signal: Option<&SignalState>) -> Option<ExitReason> {
+        if !self.is_holding_asset || self.buy_price == 0.0 { return None; }
 
-        // --- ПРІОРИТЕТ 1: EMERGENCY EXIT (Стоп-лосс) ---
-        // Не має значення, скільки барів відкрито — якщо PnL < -5%, тікаємо!
-        let pnl_pct = (current_price - self.buy_price) / self.buy_price * 100.0;
-        if pnl_pct < -5.0 {
+        // Use the candle's intrabar extremes when available so stops/targets are
+        // evaluated against the worst/best price within the bar, not just the close.
+        let check_low  = candle.map(|c| c.low).unwrap_or(current_price);
+        let check_high = candle.map(|c| c.high).unwrap_or(current_price);
+
+        // --- PRIORITY 1: hard percentage panic stop -------------------------------
+        // Never gated by min_bars_in_position. Exits at the panic price, not the
+        // (potentially wider) ATR stop, so the loss is actually capped near -X%.
+        if self.panic_stop_price > 0.0 && check_low <= self.panic_stop_price {
+            return Some(ExitReason::PanicStop);
+        }
+
+        // ATR initial stop — also a stop-loss, also never gated by min_bars.
+        if self.initial_stop_price > 0.0 && check_low <= self.initial_stop_price {
             return Some(ExitReason::InitialStop);
         }
 
-        // Жорсткий стоп по ATR
-        if current_price <= self.initial_stop_price {
-            return Some(ExitReason::InitialStop);
+        // --- PRIORITY 2: take profit ---------------------------------------------
+        if self.target_price > 0.0 && check_high >= self.target_price {
+            return Some(ExitReason::TakeProfit);
         }
 
-        // --- ПРІОРИТЕТ 2: Тайм-фільтр (Тільки для прибуткових виходів) ---
+        // --- PRIORITY 3: trend-reversal exit (the only exit gated by min_bars) ----
         if self.bars_in_position < self.config.min_bars_in_position {
             return None;
         }
-
-        // --- ПРІОРИТЕТ 3: Звичайні виходи (Take Profit / Trend change) ---
-        if let Some(signal) = _signal {
-            if signal.bearish_cross && pnl_pct > self.config.min_profit_for_rsi_exit_pct {
+        if let Some(signal) = signal {
+            if signal.bearish_cross
+                && current_price > self.buy_price * (1.0 + self.config.min_profit_for_rsi_exit_pct)
+            {
                 return Some(ExitReason::BearishCross);
             }
-        }
-
-        if self.target_price > 0.0 && current_price >= self.target_price {
-            return Some(ExitReason::TakeProfit);
         }
 
         None
@@ -543,6 +556,7 @@ impl SpotStrategy {
         self.entry_equity      = 0.0;
         self.bars_in_position  = 0;
         self.initial_stop_price = 0.0;
+        self.panic_stop_price  = 0.0;
         self.target_price      = 0.0;
     }
 
@@ -712,6 +726,7 @@ impl TradingStrategy for SpotStrategy {
             self.highest_price = self.highest_price.max(current_price);
             if let Some(reason) = self.determine_exit_reason(current_price, None, None) {
                 let trigger = match reason {
+                    ExitReason::PanicStop   => self.panic_stop_price,
                     ExitReason::InitialStop => self.initial_stop_price,
                     ExitReason::TakeProfit  => self.target_price,
                     _                       => current_price,
@@ -731,7 +746,8 @@ impl TradingStrategy for SpotStrategy {
 
     fn on_candle_close(&mut self, candle: &Candle) {
         let current_price = candle.close;
-        self.loop_count += 1;
+        // NOTE: loop_count is incremented inside `update_indicators` below; do not
+        // increment it here too or the warm-up period completes twice as fast.
 
         self.price_history.push_back(current_price);
         if self.price_history.len() > self.config.warmup_period() {
@@ -777,6 +793,7 @@ impl TradingStrategy for SpotStrategy {
             self.highest_price = self.highest_price.max(candle.high);
             if let Some(reason) = self.determine_exit_reason(current_price, Some(candle), Some(&signal)) {
                 let trigger = match reason {
+                    ExitReason::PanicStop   => self.panic_stop_price,
                     ExitReason::InitialStop => self.initial_stop_price,
                     ExitReason::TakeProfit  => self.target_price,
                     _                       => current_price,

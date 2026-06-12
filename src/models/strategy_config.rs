@@ -25,6 +25,9 @@ pub struct StrategyConfig {
     pub min_profit_for_rsi_exit_pct: f64,
     pub default_risk_per_trade_pct: f64,
     pub max_strategy_drawdown_pct: f64,
+    pub enable_short: bool,
+    /// Hard stop on unrealised loss (fraction, e.g. 0.05 = -5%). Bypasses min_bars_in_position. 0 disables.
+    pub panic_stop_loss_pct: f64,
 }
 
 impl Default for StrategyConfig {
@@ -53,6 +56,8 @@ impl Default for StrategyConfig {
             min_profit_for_rsi_exit_pct: 0.004,
             default_risk_per_trade_pct: 0.0035,
             max_strategy_drawdown_pct: 12.0,
+            enable_short: false,
+            panic_stop_loss_pct: 0.05,
         }
     }
 }
@@ -97,6 +102,8 @@ impl StrategyConfig {
             min_profit_for_rsi_exit_pct: self.min_profit_for_rsi_exit_pct,
             default_risk_per_trade_pct: self.default_risk_per_trade_pct,
             max_strategy_drawdown_pct: self.max_strategy_drawdown_pct.max(0.0),
+            enable_short: self.enable_short,
+            panic_stop_loss_pct: self.panic_stop_loss_pct.max(0.0),
         }
         .with_fallbacks(defaults)
     }
@@ -146,6 +153,8 @@ pub struct StrategyFileConfig {
     pub min_profit_for_rsi_exit_pct: Option<f64>,
     pub default_risk_per_trade_pct: Option<f64>,
     pub max_strategy_drawdown_pct: Option<f64>,
+    pub enable_short: Option<bool>,
+    pub panic_stop_loss_pct: Option<f64>,
 }
 
 impl StrategyConfig {
@@ -175,6 +184,8 @@ impl StrategyConfig {
             min_profit_for_rsi_exit_pct: file.min_profit_for_rsi_exit_pct.unwrap_or(defaults.min_profit_for_rsi_exit_pct),
             default_risk_per_trade_pct: file.default_risk_per_trade_pct.unwrap_or(defaults.default_risk_per_trade_pct),
             max_strategy_drawdown_pct: file.max_strategy_drawdown_pct.unwrap_or(defaults.max_strategy_drawdown_pct),
+            enable_short: file.enable_short.unwrap_or(defaults.enable_short),
+            panic_stop_loss_pct: file.panic_stop_loss_pct.unwrap_or(defaults.panic_stop_loss_pct),
         }
         .sanitized()
     }

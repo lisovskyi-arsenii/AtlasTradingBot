@@ -53,6 +53,8 @@ pub enum Action {
 #[derive(Debug, Copy, Clone)]
 pub enum ExitReason {
     InitialStop,
+    /// Hard percentage panic stop; bypasses min_bars_in_position and exits at the breach price.
+    PanicStop,
     TrailingStop,
     TakeProfit,
     WeakMomentumExit,
@@ -68,6 +70,7 @@ impl ExitReason {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             ExitReason::InitialStop       => "INITIAL_STOP",
+            ExitReason::PanicStop         => "PANIC_STOP",
             ExitReason::TrailingStop      => "TRAILING_STOP",
             ExitReason::TakeProfit        => "TAKE_PROFIT",
             ExitReason::WeakMomentumExit  => "WEAK_MOMENTUM_EXIT",
