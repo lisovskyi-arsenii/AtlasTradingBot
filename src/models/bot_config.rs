@@ -18,15 +18,30 @@ pub struct BotConfig {
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub backtest_csv_path: String,
+    /// Symbols traded in batch backtest (RUN_BATCH) and as live candidates when
+    /// AUTO_SCAN is off. Lets you focus capital on the alpha-generating symbols
+    /// and drop ballast that only churns fees.
+    pub backtest_symbols: Vec<String>,
     pub live_log_path: String,
     pub candle_timeframe_seconds: u64,
     pub poll_interval_seconds: u64,
+}
+
+fn default_backtest_symbols() -> Vec<String> {
+    [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT", "TRXUSDT",
+        "PEPEUSDT", "SUIUSDT", "BABYUSDT", "XLMUSDT",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             backtest_csv_path: "BTCUSDT-1h-2026-05.csv".to_string(),
+            backtest_symbols: default_backtest_symbols(),
             live_log_path: "trading_bot.csv".to_string(),
             candle_timeframe_seconds: 15 * 60,
             poll_interval_seconds: 3,
@@ -37,6 +52,7 @@ impl Default for RuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct RuntimeFileConfig {
     pub backtest_csv_path: Option<String>,
+    pub backtest_symbols: Option<Vec<String>>,
     pub live_log_path: Option<String>,
     pub candle_timeframe_seconds: Option<u64>,
     pub poll_interval_seconds: Option<u64>,
@@ -148,6 +164,12 @@ impl BotConfig {
 
         if let Some(backtest_csv_path) = file_config.runtime.backtest_csv_path {
             self.runtime.backtest_csv_path = backtest_csv_path;
+        }
+
+        if let Some(backtest_symbols) = file_config.runtime.backtest_symbols {
+            if !backtest_symbols.is_empty() {
+                self.runtime.backtest_symbols = backtest_symbols;
+            }
         }
 
         if let Some(live_log_path) = file_config.runtime.live_log_path {
