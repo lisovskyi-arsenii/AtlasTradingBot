@@ -18,8 +18,8 @@ z_score_period = 40
 ema_period = 200
 
 # Entry / exit thresholds
-z_entry = -1.0
-short_z_entry = 1.0
+z_entry = -2.5
+short_z_entry = 0.5
 atr_multiplier = 3.0
 short_stop_atr_mult = 2.0
 short_tp_atr_mult = 4.0
@@ -36,10 +36,16 @@ default_risk_per_trade_pct = 0.0035
 max_strategy_drawdown_pct = 12.0
 
 # Long/short and hard risk controls
-# Shorting is impossible on a real spot wallet, so it is disabled by default.
-enable_short = false
+# Mean-reversion both ways: long oversold dips, short overbought rips.
+enable_long = true
+# NOTE: real Binance Spot cannot short. Set true only for backtests / margin/futures.
+enable_short = true
 # Hard stop on unrealised loss (fraction): 0.05 = -5%. Bypasses min_bars_in_position. 0 disables.
 panic_stop_loss_pct = 0.05
+# Mean-reversion take-profit band: exit long when z >= z_exit, short when z <= -z_exit.
+z_exit = 1.0
+# When true, only fade dips in an uptrend / rips in a downtrend (price vs EMA). false = pure MR.
+use_trend_filter = true
 
 [runtime]
 backtest_csv_path = "BTCUSDT-1h-2026-05.csv"

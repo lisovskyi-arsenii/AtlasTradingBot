@@ -25,9 +25,14 @@ pub struct StrategyConfig {
     pub min_profit_for_rsi_exit_pct: f64,
     pub default_risk_per_trade_pct: f64,
     pub max_strategy_drawdown_pct: f64,
+    pub enable_long: bool,
     pub enable_short: bool,
     /// Hard stop on unrealised loss (fraction, e.g. 0.05 = -5%). Bypasses min_bars_in_position. 0 disables.
     pub panic_stop_loss_pct: f64,
+    /// Mean-reversion take-profit band: exit long when z >= z_exit, short when z <= -z_exit.
+    pub z_exit: f64,
+    /// When true, only fade dips in an uptrend (long) / rips in a downtrend (short) vs the EMA.
+    pub use_trend_filter: bool,
 }
 
 impl Default for StrategyConfig {
@@ -56,8 +61,11 @@ impl Default for StrategyConfig {
             min_profit_for_rsi_exit_pct: 0.004,
             default_risk_per_trade_pct: 0.0035,
             max_strategy_drawdown_pct: 12.0,
-            enable_short: false,
+            enable_long: true,
+            enable_short: true,
             panic_stop_loss_pct: 0.05,
+            z_exit: 0.0,
+            use_trend_filter: true,
         }
     }
 }
@@ -102,8 +110,11 @@ impl StrategyConfig {
             min_profit_for_rsi_exit_pct: self.min_profit_for_rsi_exit_pct,
             default_risk_per_trade_pct: self.default_risk_per_trade_pct,
             max_strategy_drawdown_pct: self.max_strategy_drawdown_pct.max(0.0),
+            enable_long: self.enable_long,
             enable_short: self.enable_short,
             panic_stop_loss_pct: self.panic_stop_loss_pct.max(0.0),
+            z_exit: self.z_exit,
+            use_trend_filter: self.use_trend_filter,
         }
         .with_fallbacks(defaults)
     }
@@ -153,8 +164,11 @@ pub struct StrategyFileConfig {
     pub min_profit_for_rsi_exit_pct: Option<f64>,
     pub default_risk_per_trade_pct: Option<f64>,
     pub max_strategy_drawdown_pct: Option<f64>,
+    pub enable_long: Option<bool>,
     pub enable_short: Option<bool>,
     pub panic_stop_loss_pct: Option<f64>,
+    pub z_exit: Option<f64>,
+    pub use_trend_filter: Option<bool>,
 }
 
 impl StrategyConfig {
@@ -173,19 +187,42 @@ impl StrategyConfig {
             z_entry: file.z_entry.unwrap_or(defaults.z_entry),
             short_z_entry: file.short_z_entry.unwrap_or(defaults.short_z_entry),
             atr_multiplier: file.atr_multiplier.unwrap_or(defaults.atr_multiplier),
-            short_stop_atr_mult: file.short_stop_atr_mult.unwrap_or(defaults.short_stop_atr_mult),
+            short_stop_atr_mult: file
+                .short_stop_atr_mult
+                .unwrap_or(defaults.short_stop_atr_mult),
             short_tp_atr_mult: file.short_tp_atr_mult.unwrap_or(defaults.short_tp_atr_mult),
-            short_cooldown_bars: file.short_cooldown_bars.unwrap_or(defaults.short_cooldown_bars),
+            short_cooldown_bars: file
+                .short_cooldown_bars
+                .unwrap_or(defaults.short_cooldown_bars),
             cooldown_bars: file.cooldown_bars.unwrap_or(defaults.cooldown_bars),
-            loss_cooldown_bars: file.loss_cooldown_bars.unwrap_or(defaults.loss_cooldown_bars),
-            take_profit_cooldown_bars: file.take_profit_cooldown_bars.unwrap_or(defaults.take_profit_cooldown_bars),
-            take_profit_r_multiplier: file.take_profit_r_multiplier.unwrap_or(defaults.take_profit_r_multiplier),
-            min_bars_in_position: file.min_bars_in_position.unwrap_or(defaults.min_bars_in_position),
-            min_profit_for_rsi_exit_pct: file.min_profit_for_rsi_exit_pct.unwrap_or(defaults.min_profit_for_rsi_exit_pct),
-            default_risk_per_trade_pct: file.default_risk_per_trade_pct.unwrap_or(defaults.default_risk_per_trade_pct),
-            max_strategy_drawdown_pct: file.max_strategy_drawdown_pct.unwrap_or(defaults.max_strategy_drawdown_pct),
+            loss_cooldown_bars: file
+                .loss_cooldown_bars
+                .unwrap_or(defaults.loss_cooldown_bars),
+            take_profit_cooldown_bars: file
+                .take_profit_cooldown_bars
+                .unwrap_or(defaults.take_profit_cooldown_bars),
+            take_profit_r_multiplier: file
+                .take_profit_r_multiplier
+                .unwrap_or(defaults.take_profit_r_multiplier),
+            min_bars_in_position: file
+                .min_bars_in_position
+                .unwrap_or(defaults.min_bars_in_position),
+            min_profit_for_rsi_exit_pct: file
+                .min_profit_for_rsi_exit_pct
+                .unwrap_or(defaults.min_profit_for_rsi_exit_pct),
+            default_risk_per_trade_pct: file
+                .default_risk_per_trade_pct
+                .unwrap_or(defaults.default_risk_per_trade_pct),
+            max_strategy_drawdown_pct: file
+                .max_strategy_drawdown_pct
+                .unwrap_or(defaults.max_strategy_drawdown_pct),
+            enable_long: file.enable_long.unwrap_or(defaults.enable_long),
             enable_short: file.enable_short.unwrap_or(defaults.enable_short),
-            panic_stop_loss_pct: file.panic_stop_loss_pct.unwrap_or(defaults.panic_stop_loss_pct),
+            panic_stop_loss_pct: file
+                .panic_stop_loss_pct
+                .unwrap_or(defaults.panic_stop_loss_pct),
+            z_exit: file.z_exit.unwrap_or(defaults.z_exit),
+            use_trend_filter: file.use_trend_filter.unwrap_or(defaults.use_trend_filter),
         }
         .sanitized()
     }
