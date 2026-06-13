@@ -68,3 +68,15 @@ live_log_path = "trading_bot.csv"
 candle_timeframe_seconds = 900
 poll_interval_seconds = 3
 
+# Relative capital weights per symbol. Total capital is unchanged; weights only
+# redistribute it. A symbol not listed defaults to weight 1.0. Empty/omitted =
+# equal split (unchanged). WARNING: weighting toward past backtest winners is
+# overfitting — symbol ranks are unstable across periods. Tune deliberately.
+# NOTE: this is a sub-table, so it MUST stay at the very end of [runtime]
+# (any plain keys after it would be parsed as weights and break the config).
+# [runtime.symbol_weights]
+# ETHUSDT = 2.0
+# XRPUSDT = 1.5
+# BTCUSDT = 0.5
+# XLMUSDT = 0.5
+

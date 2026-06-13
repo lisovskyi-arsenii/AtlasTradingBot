@@ -1,6 +1,7 @@
 use crate::models::data::{CryptoExchange, Mode};
 use crate::models::strategy_config::{StrategyConfig, StrategyFileConfig};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -22,6 +23,11 @@ pub struct RuntimeConfig {
     /// AUTO_SCAN is off. Lets you focus capital on the alpha-generating symbols
     /// and drop ballast that only churns fees.
     pub backtest_symbols: Vec<String>,
+    /// Relative capital weight per symbol (e.g. `ETHUSDT = 2.0` gets twice the
+    /// share of a coin left at the implicit default of 1.0). Lets you tilt the
+    /// book toward higher-conviction symbols without changing total capital.
+    /// Empty map = equal weighting (unchanged behaviour).
+    pub symbol_weights: HashMap<String, f64>,
     pub live_log_path: String,
     pub candle_timeframe_seconds: u64,
     pub poll_interval_seconds: u64,
@@ -42,6 +48,7 @@ impl Default for RuntimeConfig {
         Self {
             backtest_csv_path: "BTCUSDT-1h-2026-05.csv".to_string(),
             backtest_symbols: default_backtest_symbols(),
+            symbol_weights: HashMap::new(),
             live_log_path: "trading_bot.csv".to_string(),
             candle_timeframe_seconds: 15 * 60,
             poll_interval_seconds: 3,
@@ -53,6 +60,7 @@ impl Default for RuntimeConfig {
 struct RuntimeFileConfig {
     pub backtest_csv_path: Option<String>,
     pub backtest_symbols: Option<Vec<String>>,
+    pub symbol_weights: Option<HashMap<String, f64>>,
     pub live_log_path: Option<String>,
     pub candle_timeframe_seconds: Option<u64>,
     pub poll_interval_seconds: Option<u64>,
@@ -99,6 +107,32 @@ impl BotConfig {
 
         config.apply_cli_overrides(&args);
         config
+    }
+
+    /// Split `total_pool` across `symbols` according to `runtime.symbol_weights`.
+    /// A symbol with no explicit weight defaults to 1.0; if all weights are zero
+    /// (or the map is empty) capital is split equally — i.e. unchanged behaviour.
+    pub fn allocate_capital(&self, symbols: &[String], total_pool: f64) -> HashMap<String, f64> {
+        let weight_of = |s: &String| -> f64 {
+            self.runtime
+                .symbol_weights
+                .get(s)
+                .copied()
+                .unwrap_or(1.0)
+                .max(0.0)
+        };
+        let total_weight: f64 = symbols.iter().map(weight_of).sum();
+        symbols
+            .iter()
+            .map(|s| {
+                let capital = if total_weight > 0.0 {
+                    total_pool * weight_of(s) / total_weight
+                } else {
+                    total_pool / symbols.len().max(1) as f64
+                };
+                (s.clone(), capital)
+            })
+            .collect()
     }
 
     fn extract_config_path(args: &[String]) -> String {
@@ -172,6 +206,10 @@ impl BotConfig {
             }
         }
 
+        if let Some(symbol_weights) = file_config.runtime.symbol_weights {
+            self.runtime.symbol_weights = symbol_weights;
+        }
+
         if let Some(live_log_path) = file_config.runtime.live_log_path {
             self.runtime.live_log_path = live_log_path;
         }
@@ -243,6 +281,61 @@ impl BotConfig {
             "bybit" => CryptoExchange::Bybit,
             "whitebit" => CryptoExchange::Whitebit,
             _ => CryptoExchange::Binance,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn syms(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn equal_split_when_no_weights() {
+        let cfg = BotConfig::default_for_test();
+        let alloc = cfg.allocate_capital(&syms(&["A", "B", "C", "D"]), 4000.0);
+        for v in alloc.values() {
+            assert!((v - 1000.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn weights_redistribute_but_conserve_total() {
+        let mut cfg = BotConfig::default_for_test();
+        cfg.runtime.symbol_weights = HashMap::from([("A".to_string(), 3.0)]);
+        // A weight 3, B/C default 1 -> total weight 5, pool 5000.
+        let alloc = cfg.allocate_capital(&syms(&["A", "B", "C"]), 5000.0);
+        assert!((alloc["A"] - 3000.0).abs() < 1e-9);
+        assert!((alloc["B"] - 1000.0).abs() < 1e-9);
+        assert!((alloc["C"] - 1000.0).abs() < 1e-9);
+        let total: f64 = alloc.values().sum();
+        assert!((total - 5000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_weight_excludes_symbol() {
+        let mut cfg = BotConfig::default_for_test();
+        cfg.runtime.symbol_weights = HashMap::from([("B".to_string(), 0.0)]);
+        let alloc = cfg.allocate_capital(&syms(&["A", "B"]), 2000.0);
+        assert!((alloc["A"] - 2000.0).abs() < 1e-9);
+        assert!(alloc["B"].abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+impl BotConfig {
+    fn default_for_test() -> Self {
+        Self {
+            mode: Mode::Spot,
+            crypto_exchange: CryptoExchange::Binance,
+            symbol: String::new(),
+            leverage: 1.0,
+            margin: 1000.0,
+            strategy: StrategyConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }

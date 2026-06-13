@@ -176,7 +176,16 @@ async fn main() {
         let mut all_results = Vec::new();
         println!("[BATCH] Запуск пакетного тестування для {} пар...", symbols_to_test.len());
 
+        // Total pool keeps the per-run capital the same as the equal-weight case
+        // (margin per symbol); weights only redistribute it between symbols.
+        let total_pool = config.margin * symbols_to_test.len() as f64;
+        let capital_by_symbol = config.allocate_capital(&symbols_to_test, total_pool);
+
         for sym in symbols_to_test {
+            let symbol_capital = capital_by_symbol.get(&sym).copied().unwrap_or(config.margin);
+            if !config.runtime.symbol_weights.is_empty() {
+                println!("[ALLOC] {}: ${:.2}", sym, symbol_capital);
+            }
             let file_name = format!("{}-1h-auto.csv", sym);
 
             // Якщо даних немає, завантажуємо їх
@@ -190,7 +199,7 @@ async fn main() {
 
             let (log_tx, _log_rx) = mpsc::unbounded_channel();
             let mut strategy = SpotStrategy::new(
-                config.margin, &sym, log_tx, config.crypto_exchange, config.strategy.clone(), log_level.clone()
+                symbol_capital, &sym, log_tx, config.crypto_exchange, config.strategy.clone(), log_level.clone()
             );
 
             // Проганяємо бектест на датасеті
@@ -258,11 +267,17 @@ async fn main() {
     println!("[BOOT] Пари для Live торгівлі: {:?}", best_live_symbols);
 
     // 3.2 Ініціалізація та ПРОГРІВ стратегій
-    let capital_per_symbol = config.margin / best_live_symbols.len() as f64;
+    // Distribute the total live capital across symbols by configured weights
+    // (equal split when no weights are set).
+    let live_capital_by_symbol = config.allocate_capital(&best_live_symbols, config.margin);
     let mut strategies: HashMap<String, Box<dyn TradingStrategy>> = HashMap::new();
     let warmup_period = config.strategy.warmup_period();
 
     for sym in &best_live_symbols {
+        let capital_per_symbol = live_capital_by_symbol
+            .get(sym)
+            .copied()
+            .unwrap_or(config.margin / best_live_symbols.len().max(1) as f64);
         let mut strategy: Box<dyn TradingStrategy> = match config.mode {
             Mode::Spot => Box::new(SpotStrategy::new(capital_per_symbol, sym, log_tx.clone(), config.crypto_exchange, config.strategy.clone(), log_level.clone())),
             Mode::Futures => Box::new(FuturesTradingStrategy::new(capital_per_symbol, sym, log_tx.clone(), config.crypto_exchange, config.strategy.clone(), config.leverage)),
