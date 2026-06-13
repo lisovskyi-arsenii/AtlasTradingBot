@@ -7,6 +7,7 @@ use ta::{DataItem, Next};
 
 pub mod spot_strategy;
 pub mod futures_strategy;
+pub mod order_book;
 
 /// Core interface shared by all strategy implementations.
 ///
@@ -28,6 +29,11 @@ pub trait TradingStrategy {
 
     fn on_tick(&mut self, current_price: f64);
     fn on_candle_close(&mut self, candle: &Candle);
+
+    /// Feed the latest live order-book imbalance (range -1..1) into the strategy.
+    /// Default is a no-op so strategies that ignore microstructure (and the
+    /// backtest path, which has no order book) need not implement it.
+    fn set_order_book_imbalance(&mut self, _obi: f64) {}
 
     /// Feed one closed candle through all indicators.
     ///
@@ -61,11 +67,8 @@ pub trait TradingStrategy {
 
         let warmup = self.warmup_period();
         if *self.loop_count() < warmup {
-            println!(
-                "[Warming up indicators… {}/{}]",
-                self.loop_count(),
-                warmup
-            );
+            // Warm-up is silent: this runs once per candle (thousands of times in
+            // batch backtests) so it must never touch stdout on the hot path.
             return None;
         }
 

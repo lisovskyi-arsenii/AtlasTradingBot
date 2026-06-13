@@ -33,6 +33,15 @@ pub struct StrategyConfig {
     pub z_exit: f64,
     /// When true, only fade dips in an uptrend (long) / rips in a downtrend (short) vs the EMA.
     pub use_trend_filter: bool,
+    /// LIVE-ONLY: require an order-book imbalance confirmation before entering.
+    /// Has no effect in backtests (no order-book history in OHLC data), so it is
+    /// off by default and never gates the backtest harness.
+    pub use_order_book_filter: bool,
+    /// Minimum top-of-book imbalance (range -1..1) to confirm a trade: long needs
+    /// obi >= +obi_threshold (buyers stacked), short needs obi <= -obi_threshold.
+    pub obi_threshold: f64,
+    /// How many price levels of the partial-depth stream to aggregate for the OBI.
+    pub obi_depth_levels: usize,
 }
 
 impl Default for StrategyConfig {
@@ -66,6 +75,9 @@ impl Default for StrategyConfig {
             panic_stop_loss_pct: 0.05,
             z_exit: 0.0,
             use_trend_filter: true,
+            use_order_book_filter: false,
+            obi_threshold: 0.15,
+            obi_depth_levels: 5,
         }
     }
 }
@@ -115,6 +127,9 @@ impl StrategyConfig {
             panic_stop_loss_pct: self.panic_stop_loss_pct.max(0.0),
             z_exit: self.z_exit,
             use_trend_filter: self.use_trend_filter,
+            use_order_book_filter: self.use_order_book_filter,
+            obi_threshold: self.obi_threshold,
+            obi_depth_levels: self.obi_depth_levels.max(1),
         }
         .with_fallbacks(defaults)
     }
@@ -169,6 +184,9 @@ pub struct StrategyFileConfig {
     pub panic_stop_loss_pct: Option<f64>,
     pub z_exit: Option<f64>,
     pub use_trend_filter: Option<bool>,
+    pub use_order_book_filter: Option<bool>,
+    pub obi_threshold: Option<f64>,
+    pub obi_depth_levels: Option<usize>,
 }
 
 impl StrategyConfig {
@@ -223,6 +241,11 @@ impl StrategyConfig {
                 .unwrap_or(defaults.panic_stop_loss_pct),
             z_exit: file.z_exit.unwrap_or(defaults.z_exit),
             use_trend_filter: file.use_trend_filter.unwrap_or(defaults.use_trend_filter),
+            use_order_book_filter: file
+                .use_order_book_filter
+                .unwrap_or(defaults.use_order_book_filter),
+            obi_threshold: file.obi_threshold.unwrap_or(defaults.obi_threshold),
+            obi_depth_levels: file.obi_depth_levels.unwrap_or(defaults.obi_depth_levels),
         }
         .sanitized()
     }
