@@ -14,6 +14,7 @@ use ta::indicators::AverageTrueRange as Atr;
 use ta::indicators::ExponentialMovingAverage as Ema;
 use ta::indicators::RelativeStrengthIndex as Rsi;
 use ta::indicators::SimpleMovingAverage as Sma;
+use ta::Next;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub struct SpotStrategy {
@@ -67,6 +68,15 @@ pub struct SpotStrategy {
     /// Latest live order-book imbalance (range -1..1). `None` until the live
     /// depth stream delivers a book; always `None` in backtests.
     pub latest_obi: Option<f64>,
+
+    // --- Multi-timeframe macro filter ---
+    /// EMA over higher-timeframe closes (aggregated from base candles).
+    pub htf_ema: Ema,
+    /// Count of base candles seen toward the current HTF candle.
+    pub htf_bar_count: usize,
+    /// Latest HTF trend verdict: `Some(true)` = bullish, `Some(false)` = bearish,
+    /// `None` until the first HTF candle closes.
+    pub htf_trend_bullish: Option<bool>,
 }
 
 impl SpotStrategy {
@@ -128,10 +138,38 @@ impl SpotStrategy {
             target_price: 0.0,
             price_history: VecDeque::with_capacity(config.warmup_period()),
             ema_value: None,
+            htf_ema: Ema::new(config.mtf_ema_period).expect("Failed to create HTF EMA"),
+            htf_bar_count: 0,
+            htf_trend_bullish: None,
             config,
             log_tx,
             log_level,
             latest_obi: None,
+        }
+    }
+
+    /// Aggregate base candles into a higher-timeframe candle and, once one
+    /// completes, refresh the HTF trend verdict from its EMA. Called once per
+    /// base candle so it also works in backtests.
+    fn update_htf_trend(&mut self, close: f64) {
+        self.htf_bar_count += 1;
+        if self.htf_bar_count >= self.config.mtf_bars {
+            self.htf_bar_count = 0;
+            let htf_ema_value = self.htf_ema.next(close);
+            self.htf_trend_bullish = Some(close > htf_ema_value);
+        }
+    }
+
+    /// Multi-timeframe confirmation gate. Returns `true` when the filter is off
+    /// (backtest/live unaffected) or no HTF candle has closed yet; otherwise a
+    /// long needs a bullish HTF trend and a short needs a bearish one.
+    fn mtf_confirms(&self, want_long: bool) -> bool {
+        if !self.config.use_mtf_filter {
+            return true;
+        }
+        match self.htf_trend_bullish {
+            Some(bullish) => bullish == want_long,
+            None => true,
         }
     }
 
@@ -385,6 +423,11 @@ impl SpotStrategy {
             return Action::NoSignal;
         }
 
+        // Higher-timeframe trend gate: only buy dips when the macro trend is up.
+        if !self.mtf_confirms(true) {
+            return Action::NoSignal;
+        }
+
         // LIVE-only microstructure confirmation: don't fade a dip into a wall of
         // sellers. No-op in backtests (filter off / no book).
         if !self.order_book_confirms(true) {
@@ -436,6 +479,11 @@ impl SpotStrategy {
 
         // Mutually exclusive with an open long (see try_enter_position).
         if self.is_short || self.is_holding_asset || self.drawdown_stop_active {
+            return Action::NoSignal;
+        }
+
+        // Higher-timeframe trend gate: only short rips when the macro trend is down.
+        if !self.mtf_confirms(false) {
             return Action::NoSignal;
         }
 
@@ -1051,6 +1099,10 @@ impl TradingStrategy for SpotStrategy {
         let current_price = candle.close;
         // NOTE: loop_count is incremented inside `update_indicators` below; do not
         // increment it here too or the warm-up period completes twice as fast.
+
+        // Update the higher-timeframe trend every base candle (also in backtests),
+        // before any early return, so HTF aggregation stays aligned with the data.
+        self.update_htf_trend(current_price);
 
         self.price_history.push_back(current_price);
         if self.price_history.len() > self.config.warmup_period() {
