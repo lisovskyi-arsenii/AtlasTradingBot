@@ -14,6 +14,7 @@ use crate::models::candle_log_entry::CandleLogEntry;
 use crate::models::data::{BacktestResult, CandleBuilder, Mode};
 use crate::network::binance::binance_client::fetch_historical_candles;
 use crate::network::binance::binance_websocket_client::run_binance_websocket_client;
+use crate::network::binance::binance_depth_client::run_binance_depth_client;
 use crate::strategy::futures_strategy::FuturesTradingStrategy;
 use crate::strategy::spot_strategy::SpotStrategy;
 use crate::strategy::TradingStrategy;
@@ -289,6 +290,17 @@ async fn main() {
     // Центральний канал для f64 перетворюється на (String, f64), щоб знати від кого ціна
     let (main_price_tx, mut main_price_rx) = mpsc::unbounded_channel::<(String, f64)>();
 
+    // Optional LIVE-only order-book-imbalance feed (one channel for all symbols).
+    let (obi_tx, mut obi_rx) = mpsc::unbounded_channel::<(String, f64)>();
+    let use_obi = config.strategy.use_order_book_filter;
+    let obi_levels = config.strategy.obi_depth_levels;
+    if use_obi {
+        println!(
+            "[BOOT] Order-book filter ON (levels={}, threshold={:.2}).",
+            obi_levels, config.strategy.obi_threshold
+        );
+    }
+
     for sym in strategies.keys() {
         let ws_symbol = sym.clone();
         let (local_tx, mut local_rx) = mpsc::unbounded_channel::<f64>();
@@ -306,6 +318,22 @@ async fn main() {
                 let _ = main_tx_clone.send((sym_clone.clone(), price));
             }
         });
+
+        // Окремий стрім стакану для OBI-фільтра (лише якщо ввімкнено).
+        if use_obi {
+            let depth_symbol = sym.clone();
+            let (depth_local_tx, mut depth_local_rx) = mpsc::unbounded_channel::<f64>();
+            let obi_tx_clone = obi_tx.clone();
+            let obi_sym = sym.clone();
+            tokio::spawn(async move {
+                run_binance_depth_client(&depth_symbol, obi_levels, depth_local_tx).await;
+            });
+            tokio::spawn(async move {
+                while let Some(obi) = depth_local_rx.recv().await {
+                    let _ = obi_tx_clone.send((obi_sym.clone(), obi));
+                }
+            });
+        }
     }
 
     println!("[BOOT] Live mode engaged for {} symbols!", strategies.len());
@@ -316,6 +344,13 @@ async fn main() {
     let mut last_candle_time = Instant::now();
 
     loop {
+        // Підтягуємо найсвіжіший дисбаланс стакану перед обробкою тіків.
+        while let Ok((sym, obi)) = obi_rx.try_recv() {
+            if let Some(strategy) = strategies.get_mut(&sym) {
+                strategy.set_order_book_imbalance(obi);
+            }
+        }
+
         // Читаємо ціну та її символ
         if let Ok((sym, price)) = main_price_rx.try_recv() {
             if let Some(strategy) = strategies.get_mut(&sym) {

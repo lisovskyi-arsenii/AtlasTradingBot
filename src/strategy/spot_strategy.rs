@@ -64,6 +64,9 @@ pub struct SpotStrategy {
     pub config: StrategyConfig,
     pub log_tx: UnboundedSender<CandleLogEntry>,
     pub log_level: LogLevel,
+    /// Latest live order-book imbalance (range -1..1). `None` until the live
+    /// depth stream delivers a book; always `None` in backtests.
+    pub latest_obi: Option<f64>,
 }
 
 impl SpotStrategy {
@@ -128,6 +131,21 @@ impl SpotStrategy {
             config,
             log_tx,
             log_level,
+            latest_obi: None,
+        }
+    }
+
+    /// Order-book confirmation gate (LIVE only). Returns `true` when the filter
+    /// is disabled (so backtests and unconfigured live runs are unaffected), or
+    /// when the latest imbalance backs the requested side.
+    fn order_book_confirms(&self, want_long: bool) -> bool {
+        if !self.config.use_order_book_filter {
+            return true;
+        }
+        match self.latest_obi {
+            Some(obi) if want_long => obi >= self.config.obi_threshold,
+            Some(obi) => obi <= -self.config.obi_threshold,
+            None => false,
         }
     }
 
@@ -367,6 +385,12 @@ impl SpotStrategy {
             return Action::NoSignal;
         }
 
+        // LIVE-only microstructure confirmation: don't fade a dip into a wall of
+        // sellers. No-op in backtests (filter off / no book).
+        if !self.order_book_confirms(true) {
+            return Action::NoSignal;
+        }
+
         let stop_distance = atr_value * self.config.atr_multiplier;
         let risk_amount = self.current_equity * self.config.default_risk_per_trade_pct;
         // Size off the stop that will actually trigger first: the tighter of the ATR
@@ -412,6 +436,12 @@ impl SpotStrategy {
 
         // Mutually exclusive with an open long (see try_enter_position).
         if self.is_short || self.is_holding_asset || self.drawdown_stop_active {
+            return Action::NoSignal;
+        }
+
+        // LIVE-only microstructure confirmation: don't short a rip into a wall of
+        // buyers. No-op in backtests (filter off / no book).
+        if !self.order_book_confirms(false) {
             return Action::NoSignal;
         }
 
@@ -988,6 +1018,10 @@ impl TradingStrategy for SpotStrategy {
     }
     fn total_trades(&self) -> usize {
         self.trade_history.len()
+    }
+
+    fn set_order_book_imbalance(&mut self, obi: f64) {
+        self.latest_obi = Some(obi);
     }
 
     fn on_tick(&mut self, current_price: f64) {
