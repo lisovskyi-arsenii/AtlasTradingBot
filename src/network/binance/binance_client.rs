@@ -1,15 +1,10 @@
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use crate::models::candle::Candle;
 use crate::models::crypto_dto::CryptoPriceResult;
-use crate::network::client::{parse_price_from_json, BinancePriceRequest};
+use crate::network::client::BinancePriceRequest;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_tungstenite::connect_async;
-use tungstenite::Message;
 use crate::network::ExchangeClient;
-use crate::utility::utility::sleep_seconds;
 
 pub struct BinanceClient;
 
