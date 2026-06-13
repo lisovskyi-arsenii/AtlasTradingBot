@@ -5,8 +5,10 @@ pub mod utility;
 pub mod spot;
 pub mod futures;
 pub mod logs;
+pub mod metrics;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use crate::logs::csv::write_to_csv_file;
 use crate::models::bot_config::BotConfig;
 use crate::models::candle::Candle;
@@ -19,6 +21,7 @@ use crate::strategy::futures_strategy::FuturesTradingStrategy;
 use crate::strategy::spot_strategy::SpotStrategy;
 use crate::strategy::TradingStrategy;
 use crate::utility::utility::sleep_milliseconds;
+use crate::metrics::{BotMetrics, SymbolSnapshot, update_metrics, run_metrics_server};
 
 use csv::ReaderBuilder;
 use reqwest::Client;
@@ -84,7 +87,35 @@ pub fn run_single_csv_backtest(
     let candles = load_candles_from_csv(file_path)?;
     println!("[VALIDATOR] Завантажено свічок: {}", candles.len());
 
-    for candle in &candles {
+    // Load BTC data if circuit-breaker filter is enabled
+    let btc_candles = if strategy.config.use_btc_circuit_breaker {
+        let btc_file = "BTCUSDT-1h-auto.csv";
+        if Path::new(btc_file).exists() {
+            match load_candles_from_csv(btc_file) {
+                Ok(btc_data) => {
+                    println!("[BTC-CIRCUIT-BREAKER] Завантажено BTC свічок: {}", btc_data.len());
+                    Some(btc_data)
+                }
+                Err(e) => {
+                    eprintln!("[WARNING] Не вдалося завантажити BTC дані: {}. Фільтр вимкнено.", e);
+                    None
+                }
+            }
+        } else {
+            eprintln!("[WARNING] Файл {} не знайдено. Фільтр вимкнено.", btc_file);
+            None
+        }
+    } else {
+        None
+    };
+
+    for (i, candle) in candles.iter().enumerate() {
+        // Update BTC price if filter is enabled and data is available
+        if let Some(ref btc_data) = btc_candles {
+            if i < btc_data.len() {
+                strategy.update_btc_price(btc_data[i].close);
+            }
+        }
         strategy.on_candle_close(candle);
     }
 
@@ -353,6 +384,16 @@ async fn main() {
 
     println!("[BOOT] Live mode engaged for {} symbols!", strategies.len());
 
+    // 3.5 Start Prometheus metrics server (if configured)
+    let bot_metrics = Arc::new(BotMetrics::new());
+    let metrics_port = config.runtime.metrics_port;
+    if metrics_port > 0 {
+        let metrics_clone = Arc::clone(&bot_metrics);
+        tokio::spawn(async move {
+            run_metrics_server(metrics_clone, metrics_port).await;
+        });
+    }
+
     // 3.4 Головний цикл торгівлі
     let mut current_candles: HashMap<String, CandleBuilder> = HashMap::new();
     let candle_timeframe = Duration::from_secs(config.runtime.candle_timeframe_seconds);
@@ -379,18 +420,29 @@ async fn main() {
                 // Якщо час вийшов — закриваємо свічки для ВСІХ пар
                 if last_candle_time.elapsed() >= candle_timeframe {
                     let mut total_equity = 0.0;
+                    let mut snapshots: Vec<SymbolSnapshot> = Vec::new();
 
                     for (s, b) in current_candles.iter_mut() {
                         let candle = Candle { open: b.open, high: b.high, low: b.low, close: b.close, volume: 0.0 };
-                        if let Some(strat) = strategies.get_mut(s) {
-                            strat.on_candle_close(&candle);
+                        if let Some(strategy) = strategies.get_mut(s) {
+                            strategy.on_candle_close(&candle);
                             println!("[LIVE] {} Candle: O={:.2} H={:.2} L={:.2} C={:.2}", s, candle.open, candle.high, candle.low, candle.close);
 
                             // Збираємо еквайті для портфельного статусу
-                            total_equity += strat.final_equity(candle.close);
+                            total_equity += strategy.final_equity(candle.close);
+
+                            // Create metrics snapshot for SpotStrategy
+                            if let Some(spot_strat) = strategy.as_any().downcast_ref::<SpotStrategy>() {
+                                snapshots.push(spot_strat.to_metrics_snapshot(candle.close));
+                            }
                         }
                         // Скидаємо свічку використовуючи останню ціну закриття
                         *b = CandleBuilder::new(candle.close);
+                    }
+
+                    // Update Prometheus metrics
+                    if !snapshots.is_empty() {
+                        update_metrics(&bot_metrics, &snapshots, config.margin);
                     }
 
                     let pnl = ((total_equity - config.margin) / config.margin) * 100.0;

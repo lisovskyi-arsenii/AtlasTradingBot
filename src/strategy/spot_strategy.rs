@@ -17,6 +17,13 @@ use ta::indicators::SimpleMovingAverage as Sma;
 use ta::Next;
 use tokio::sync::mpsc::UnboundedSender;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VolatilityRegime {
+    Low,    // ATR < 1.5% of price
+    Normal, // ATR 1.5% - 3% of price
+    High,   // ATR > 3% of price
+}
+
 pub struct SpotStrategy {
     pub slow_sma: Sma,
     pub fast_sma: Sma,
@@ -62,12 +69,72 @@ pub struct SpotStrategy {
     pub target_price: f64,
     pub price_history: VecDeque<f64>,
     pub ema_value: Option<f64>,
+    
+    // --- Dynamic trailing stop-loss ---
+    /// Dynamic trailing stop price (updates with price movement)
+    pub dynamic_trailing_stop: f64,
+    /// Flag to enable/disable dynamic trailing stop
+    pub use_dynamic_trailing_stop: bool,
     pub config: StrategyConfig,
     pub log_tx: UnboundedSender<CandleLogEntry>,
     pub log_level: LogLevel,
     /// Latest live order-book imbalance (range -1..1). `None` until the live
     /// depth stream delivers a book; always `None` in backtests.
     pub latest_obi: Option<f64>,
+    
+    // --- Bid-ask spread analysis ---
+    /// Latest bid-ask spread percentage
+    pub latest_spread_pct: f64,
+    /// Maximum allowed spread percentage for entries
+    pub max_spread_pct: f64,
+    
+    // --- Time-of-day patterns ---
+    /// Hour of day (0-23) for the last candle
+    pub current_hour: u8,
+    /// Preferred trading hours (bitmask: bit 0 = hour 0, etc.)
+    pub preferred_hours_mask: u32,
+    
+    // --- Fear & Greed Index ---
+    /// Current Fear & Greed Index value (0-100)
+    pub fear_greed_index: f64,
+    /// Last update timestamp for Fear & Greed Index
+    pub fear_greed_last_update: i64,
+    
+    // --- Adaptive Parameter Tuning ---
+    /// Recent trade results for performance tracking
+    pub recent_trades: VecDeque<f64>, // PnL percentages
+    /// Adaptive risk multiplier based on recent performance
+    pub adaptive_risk_multiplier: f64,
+    /// Base risk per trade percentage
+    pub base_risk_per_trade_pct: f64,
+    /// Number of recent trades to track for performance
+    pub recent_trades_window: usize,
+    /// Minimum adaptive risk multiplier
+    pub min_adaptive_risk: f64,
+    /// Maximum adaptive risk multiplier
+    pub max_adaptive_risk: f64,
+    
+    // --- Order Splitting ---
+    /// Enable order splitting for large positions
+    pub enable_order_splitting: bool,
+    /// Maximum order size in USDT before splitting
+    pub max_order_size_usdt: f64,
+    /// Number of splits for large orders
+    pub order_split_count: usize,
+    /// Minimum order size in USDT
+    pub min_order_size_usdt: f64,
+    
+    // --- Safety Limits ---
+    /// Maximum position size in USDT
+    pub max_position_size_usdt: f64,
+    /// Daily loss limit in USDT
+    pub daily_loss_limit_usdt: f64,
+    /// Daily PnL tracking
+    pub daily_pnl: f64,
+    /// Daily trade count
+    pub daily_trade_count: usize,
+    /// Last reset timestamp for daily limits
+    pub daily_reset_timestamp: i64,
 
     // --- Multi-timeframe macro filter ---
     /// EMA over higher-timeframe closes (aggregated from base candles).
@@ -77,6 +144,22 @@ pub struct SpotStrategy {
     /// Latest HTF trend verdict: `Some(true)` = bullish, `Some(false)` = bearish,
     /// `None` until the first HTF candle closes.
     pub htf_trend_bullish: Option<bool>,
+    /// 4H timeframe EMA for additional confirmation
+    pub ema_4h: Ema,
+    /// 4H bar count
+    pub ema_4h_bar_count: usize,
+    /// 4H trend verdict
+    pub ema_4h_bullish: Option<bool>,
+
+    // --- BTC circuit-breaker filter ---
+    /// BTC price history for crash detection.
+    pub btc_price_history: VecDeque<f64>,
+
+    // --- Volatility regime detection ---
+    /// ATR history for regime detection.
+    pub atr_history: VecDeque<f64>,
+    /// Current volatility regime.
+    pub current_regime: VolatilityRegime,
 }
 
 impl SpotStrategy {
@@ -138,13 +221,42 @@ impl SpotStrategy {
             target_price: 0.0,
             price_history: VecDeque::with_capacity(config.warmup_period()),
             ema_value: None,
+            dynamic_trailing_stop: 0.0,
+            use_dynamic_trailing_stop: false,
             htf_ema: Ema::new(config.mtf_ema_period).expect("Failed to create HTF EMA"),
             htf_bar_count: 0,
             htf_trend_bullish: None,
-            config,
+            ema_4h: Ema::new(50).expect("Failed to create 4H EMA"),
+            ema_4h_bar_count: 0,
+            ema_4h_bullish: None,
+            btc_price_history: VecDeque::with_capacity(config.btc_crash_lookback_bars + 10),
+            atr_history: VecDeque::with_capacity(50),
+            current_regime: VolatilityRegime::Normal,
             log_tx,
             log_level,
             latest_obi: None,
+            latest_spread_pct: 0.0,
+            max_spread_pct: 0.5,
+            current_hour: 0,
+            preferred_hours_mask: 0xFFFFFFFF,
+            fear_greed_index: 50.0,
+            fear_greed_last_update: 0,
+            recent_trades: VecDeque::with_capacity(20),
+            adaptive_risk_multiplier: 1.0,
+            base_risk_per_trade_pct: config.default_risk_per_trade_pct,
+            recent_trades_window: 20,
+            min_adaptive_risk: 0.5,
+            max_adaptive_risk: 1.5,
+            enable_order_splitting: true,
+            max_order_size_usdt: 1000.0,
+            order_split_count: 5,
+            min_order_size_usdt: 10.0,
+            max_position_size_usdt: 5000.0,
+            daily_loss_limit_usdt: 500.0,
+            daily_pnl: 0.0,
+            daily_trade_count: 0,
+            daily_reset_timestamp: chrono::Utc::now().timestamp(),
+            config,
         }
     }
 
@@ -160,16 +272,90 @@ impl SpotStrategy {
         }
     }
 
+    /// Update 4H timeframe trend (4H = 4 * 1H candles)
+    fn update_4h_trend(&mut self, close: f64) {
+        self.ema_4h_bar_count += 1;
+        if self.ema_4h_bar_count >= 4 {
+            self.ema_4h_bar_count = 0;
+            let ema_4h_value = self.ema_4h.next(close);
+            self.ema_4h_bullish = Some(close > ema_4h_value);
+        }
+    }
+
     /// Multi-timeframe confirmation gate. Returns `true` when the filter is off
     /// (backtest/live unaffected) or no HTF candle has closed yet; otherwise a
     /// long needs a bullish HTF trend and a short needs a bearish one.
+    /// Enhanced with 4H confirmation for higher confidence.
     fn mtf_confirms(&self, want_long: bool) -> bool {
         if !self.config.use_mtf_filter {
             return true;
         }
-        match self.htf_trend_bullish {
+        
+        // Check HTF trend (existing logic)
+        let htf_confirms = match self.htf_trend_bullish {
             Some(bullish) => bullish == want_long,
             None => true,
+        };
+        
+        // Check 4H trend (new logic)
+        let ema_4h_confirms = match self.ema_4h_bullish {
+            Some(bullish) => bullish == want_long,
+            None => true,
+        };
+        
+        // Both timeframes must agree for entry
+        htf_confirms && ema_4h_confirms
+    }
+
+    /// Update volatility regime based on ATR history.
+    /// Low: ATR < 1.5% of price, Normal: 1.5-3%, High: > 3%
+    fn update_volatility_regime(&mut self, atr_value: f64, current_price: f64) {
+        let atr_pct = (atr_value / current_price) * 100.0;
+        
+        self.atr_history.push_back(atr_pct);
+        if self.atr_history.len() > 50 {
+            self.atr_history.pop_front();
+        }
+
+        // Use average of recent ATR values for regime detection
+        if self.atr_history.len() >= 20 {
+            let avg_atr_pct: f64 = self.atr_history.iter().sum::<f64>() / self.atr_history.len() as f64;
+            
+            self.current_regime = if avg_atr_pct < 1.5 {
+                VolatilityRegime::Low
+            } else if avg_atr_pct < 3.0 {
+                VolatilityRegime::Normal
+            } else {
+                VolatilityRegime::High
+            };
+        }
+    }
+
+    /// Update dynamic trailing stop for open positions
+    fn update_dynamic_trailing_stop(&mut self, current_price: f64, atr_value: f64) {
+        if !self.use_dynamic_trailing_stop || !self.is_holding_asset {
+            return;
+        }
+
+        // Initialize trailing stop on first update
+        if self.dynamic_trailing_stop == 0.0 {
+            self.dynamic_trailing_stop = self.initial_stop_price;
+            return;
+        }
+
+        // Calculate new trailing stop: current price - 2 * ATR
+        let new_trailing_stop = current_price - (atr_value * 2.0);
+        
+        // Only move stop up (for long positions), never down
+        if new_trailing_stop > self.dynamic_trailing_stop {
+            self.dynamic_trailing_stop = new_trailing_stop;
+            
+            if self.log_debug() {
+                println!(
+                    "[TRAILING-STOP] Updated to ${:.2} (price: ${:.2}, ATR: ${:.2})",
+                    self.dynamic_trailing_stop, current_price, atr_value
+                );
+            }
         }
     }
 
@@ -183,8 +369,275 @@ impl SpotStrategy {
         match self.latest_obi {
             Some(obi) if want_long => obi >= self.config.obi_threshold,
             Some(obi) => obi <= -self.config.obi_threshold,
-            None => false,
+            None => true,
         }
+    }
+
+    /// Bid-ask spread confirmation gate. Returns `true` when the spread is
+    /// within acceptable limits. In backtests, always returns `true` since
+    /// we don't have real-time spread data.
+    fn spread_confirms(&self) -> bool {
+        // In backtests, we don't have real-time spread data, so always allow
+        if self.latest_spread_pct == 0.0 {
+            return true;
+        }
+        
+        // Block entries if spread is too wide
+        if self.latest_spread_pct > self.max_spread_pct {
+            if self.log_debug() {
+                println!(
+                    "[SPREAD] BLOCKED: Spread {:.3}% exceeds max {:.3}%",
+                    self.latest_spread_pct, self.max_spread_pct
+                );
+            }
+            return false;
+        }
+        
+        true
+    }
+
+    /// Time-of-day pattern confirmation gate. Returns `true` when the current
+    /// hour is within preferred trading hours. In backtests, we don't have
+    /// real-time timestamps, so always returns `true`.
+    fn time_of_day_confirms(&self) -> bool {
+        // In backtests without timestamp data, always allow
+        if self.current_hour == 0 && self.preferred_hours_mask == 0xFFFFFFFF {
+            return true;
+        }
+        
+        // Check if current hour is in preferred hours mask
+        let hour_bit = 1u32 << self.current_hour;
+        let is_preferred = (self.preferred_hours_mask & hour_bit) != 0;
+        
+        if !is_preferred && self.log_debug() {
+            println!(
+                "[TIME-OF-DAY] BLOCKED: Hour {} not in preferred hours mask",
+                self.current_hour
+            );
+        }
+        
+        is_preferred
+    }
+
+    /// Update Fear & Greed Index (LIVE only - called from external API)
+    pub fn update_fear_greed_index(&mut self, index: f64) {
+        self.fear_greed_index = index.clamp(0.0, 100.0);
+        self.fear_greed_last_update = chrono::Utc::now().timestamp();
+        
+        if self.log_debug() {
+            println!("[FEAR-GREED] Updated to {:.0}", self.fear_greed_index);
+        }
+    }
+
+    /// Fear & Greed Index confirmation gate
+    /// Returns true when sentiment supports the trade direction
+    fn fear_greed_confirms(&self, want_long: bool) -> bool {
+        // In backtests, always allow (no API access)
+        if self.fear_greed_last_update == 0 {
+            return true;
+        }
+        
+        // Extreme greed (>75): Avoid longs, prefer shorts
+        if self.fear_greed_index > 75.0 && want_long {
+            if self.log_debug() {
+                println!("[FEAR-GREED] BLOCKED: Extreme greed ({:.0}), avoid longs", self.fear_greed_index);
+            }
+            return false;
+        }
+        
+        // Extreme fear (<25): Avoid shorts, prefer longs
+        if self.fear_greed_index < 25.0 && !want_long {
+            if self.log_debug() {
+                println!("[FEAR-GREED] BLOCKED: Extreme fear ({:.0}), avoid shorts", self.fear_greed_index);
+            }
+            return false;
+        }
+        
+        true
+    }
+
+    /// Record a trade result for adaptive parameter tuning
+    pub fn record_trade_result(&mut self, pnl_pct: f64) {
+        self.recent_trades.push_back(pnl_pct);
+        if self.recent_trades.len() > self.recent_trades_window {
+            self.recent_trades.pop_front();
+        }
+        
+        // Update adaptive risk multiplier based on recent performance
+        self.update_adaptive_risk();
+    }
+
+    /// Update adaptive risk multiplier based on recent trade performance
+    fn update_adaptive_risk(&mut self) {
+        if self.recent_trades.len() < 5 {
+            return; // Need at least 5 trades to make a decision
+        }
+        
+        let wins = self.recent_trades.iter().filter(|&&x| x > 0.0).count();
+        let total = self.recent_trades.len();
+        let win_rate = wins as f64 / total as f64;
+        
+        let avg_pnl: f64 = self.recent_trades.iter().sum::<f64>() / total as f64;
+        
+        // Calculate new risk multiplier based on performance
+        let new_multiplier = if win_rate > 0.6 && avg_pnl > 0.01 {
+            // High performance: increase risk
+            1.0 + (win_rate - 0.5) * 2.0
+        } else if win_rate < 0.4 || avg_pnl < -0.01 {
+            // Poor performance: decrease risk
+            1.0 - (0.5 - win_rate) * 2.0
+        } else {
+            // Average performance: maintain current risk
+            self.adaptive_risk_multiplier
+        };
+        
+        // Clamp to min/max bounds
+        self.adaptive_risk_multiplier = new_multiplier.clamp(self.min_adaptive_risk, self.max_adaptive_risk);
+        
+        if self.log_debug() && (self.adaptive_risk_multiplier != 1.0) {
+            println!(
+                "[ADAPTIVE-RISK] Win rate: {:.1}%, Avg PnL: {:.2}%, Risk multiplier: {:.2}",
+                win_rate * 100.0, avg_pnl * 100.0, self.adaptive_risk_multiplier
+            );
+        }
+    }
+
+    /// Get current risk per trade with adaptive adjustment
+    fn get_adaptive_risk_per_trade(&self) -> f64 {
+        self.base_risk_per_trade_pct * self.adaptive_risk_multiplier
+    }
+
+    /// Adjust parameters based on volatility regime
+    fn adjust_parameters_for_regime(&mut self) {
+        match self.current_regime {
+            VolatilityRegime::Low => {
+                // Low volatility: can be more aggressive
+                self.adaptive_risk_multiplier = self.adaptive_risk_multiplier.min(self.max_adaptive_risk * 1.2);
+            }
+            VolatilityRegime::High => {
+                // High volatility: be more conservative
+                self.adaptive_risk_multiplier = self.adaptive_risk_multiplier.min(self.min_adaptive_risk * 0.8);
+            }
+            VolatilityRegime::Normal => {
+                // Normal volatility: use standard bounds
+            }
+        }
+    }
+
+    /// Check if daily limits allow new entry
+    fn check_daily_limits(&mut self) -> bool {
+        let now: i64 = chrono::Utc::now().timestamp();
+        let day_seconds: i64 = 86400;
+        
+        // Reset daily counters if new day
+        if now - self.daily_reset_timestamp > day_seconds {
+            self.daily_pnl = 0.0;
+            self.daily_trade_count = 0;
+            self.daily_reset_timestamp = now;
+            
+            if self.log_debug() {
+                println!("[DAILY-LIMITS] Reset daily counters");
+            }
+        }
+        
+        // Check daily loss limit
+        if self.daily_pnl < -self.daily_loss_limit_usdt {
+            if self.log_debug() {
+                println!(
+                    "[DAILY-LIMITS] BLOCKED: Daily loss ${:.2} exceeds limit ${:.2}",
+                    -self.daily_pnl, self.daily_loss_limit_usdt
+                );
+            }
+            return false;
+        }
+        
+        true
+    }
+
+    /// Calculate split order sizes for large positions
+    fn calculate_split_orders(&self, total_usdt: f64) -> Vec<f64> {
+        if !self.enable_order_splitting || total_usdt <= self.max_order_size_usdt {
+            return vec![total_usdt];
+        }
+        
+        let split_count = (total_usdt / self.max_order_size_usdt).ceil() as usize;
+        let split_count = split_count.min(self.order_split_count).max(2);
+        
+        let base_size = total_usdt / split_count as f64;
+        
+        // Ensure each split meets minimum order size
+        if base_size < self.min_order_size_usdt {
+            return vec![total_usdt]; // Can't split further
+        }
+        
+        let mut orders = vec![base_size; split_count];
+        
+        // Adjust last order to account for rounding
+        let sum: f64 = orders.iter().sum();
+        orders[split_count - 1] += total_usdt - sum;
+        
+        if self.log_debug() {
+            println!(
+                "[ORDER-SPLIT] Splitting ${:.2} into {} orders of ${:.2} each",
+                total_usdt, split_count, base_size
+            );
+        }
+        
+        orders
+    }
+
+    /// Check if position size exceeds maximum
+    fn check_position_size_limit(&self, position_usdt: f64) -> bool {
+        if position_usdt > self.max_position_size_usdt {
+            if self.log_debug() {
+                println!(
+                    "[SAFETY-LIMIT] BLOCKED: Position ${:.2} exceeds max ${:.2}",
+                    position_usdt, self.max_position_size_usdt
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Update BTC price history for circuit-breaker filter. Called once per
+    /// candle close (backtest) or tick (live) to maintain the price window.
+    pub fn update_btc_price(&mut self, btc_price: f64) {
+        self.btc_price_history.push_back(btc_price);
+        let max_len = self.config.btc_crash_lookback_bars + 10;
+        while self.btc_price_history.len() > max_len {
+            self.btc_price_history.pop_front();
+        }
+    }
+
+    /// BTC circuit-breaker confirmation gate. Returns `true` when the filter
+    /// is disabled (so backtests and unconfigured live runs are unaffected), or
+    /// when BTC is NOT crashing (i.e., price change is above the crash threshold).
+    /// A crash is defined as a negative price change exceeding btc_crash_threshold_pct
+    /// over the btc_crash_lookback_bars period.
+    fn btc_circuit_breaker_confirms(&self) -> bool {
+        if !self.config.use_btc_circuit_breaker {
+            return true;
+        }
+        let lookback = self.config.btc_crash_lookback_bars;
+        if self.btc_price_history.len() < lookback + 1 {
+            // Not enough data yet - allow entries
+            return true;
+        }
+        let current_price: f64 = *self.btc_price_history.back().unwrap();
+        let lookback_price: f64 = self.btc_price_history[self.btc_price_history.len() - lookback - 1];
+        let price_change_pct = (current_price - lookback_price) / lookback_price;
+        // Block entries if BTC is crashing (price change is below the negative threshold)
+        let is_crashing = price_change_pct <= self.config.btc_crash_threshold_pct;
+        if is_crashing && self.log_normal() {
+            println!(
+                "[BTC-CIRCUIT-BREAKER] BLOCKED: BTC change {:.2}% (threshold {:.2}%) over {} bars",
+                price_change_pct * 100.0,
+                self.config.btc_crash_threshold_pct * 100.0,
+                lookback
+            );
+        }
+        !is_crashing
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
@@ -226,6 +679,7 @@ impl SpotStrategy {
         if !self.is_short || self.short_entry_price <= 0.0 || self.short_margin_usdt <= 0.0 {
             return 0.0;
         }
+
         self.short_margin_usdt * (self.short_entry_price - current_price) / self.short_entry_price
     }
 
@@ -252,13 +706,13 @@ impl SpotStrategy {
         if self.equity_curve.is_empty() {
             return 0.0;
         }
-        let mut peak = self.equity_curve[0].equity;
-        let mut max_dd = 0.0;
+        let mut peak: f64 = self.equity_curve[0].equity;
+        let mut max_dd: f64 = 0.0;
         for pt in &self.equity_curve {
             if pt.equity > peak {
                 peak = pt.equity;
             }
-            let dd = (pt.equity - peak) / peak * 100.0;
+            let dd: f64 = (pt.equity - peak) / peak * 100.0;
             if dd < max_dd {
                 max_dd = dd;
             }
@@ -267,10 +721,11 @@ impl SpotStrategy {
     }
 
     pub fn expectancy_per_trade_usdt(&self) -> f64 {
-        let n = self.trade_history.len();
+        let n: usize = self.trade_history.len();
         if n == 0 {
             return 0.0;
         }
+
         self.trade_history.iter().map(|t| t.pnl_usdt).sum::<f64>() / n as f64
     }
 
@@ -295,7 +750,7 @@ impl SpotStrategy {
             return;
         }
 
-        let drawdown_pct = (self.peak_equity - self.current_equity) / self.peak_equity * 100.0;
+        let drawdown_pct: f64 = (self.peak_equity - self.current_equity) / self.peak_equity * 100.0;
         if drawdown_pct > self.config.max_strategy_drawdown_pct {
             if !self.drawdown_stop_active && self.log_normal() {
                 println!(
@@ -324,22 +779,22 @@ impl SpotStrategy {
         // price above the slow EMA; downtrend is the mirror. This double check keeps
         // mean-reversion longs out of bear-market bounces (buying dips that keep
         // falling) and shorts out of bull-market pullbacks.
-        let bullish_trend = ema_fast > ema_slow && current_price > ema_slow;
-        let bearish_trend = ema_fast < ema_slow && current_price < ema_slow;
+        let bullish_trend: bool = ema_fast > ema_slow && current_price > ema_slow;
+        let bearish_trend: bool = ema_fast < ema_slow && current_price < ema_slow;
 
         // RSI guard: don't buy a dip that is already deeply overbought, and don't
         // short a rip that is already deeply oversold.
-        let rsi_ok_long = rsi_val < 70.0;
-        let rsi_ok_short = rsi_val > 30.0;
-        let vol_ok = vol_val > vol_sma_val;
+        let rsi_ok_long: bool = rsi_val < 70.0;
+        let rsi_ok_short: bool = rsi_val > 30.0;
+        let vol_ok: bool = vol_val > vol_sma_val;
 
         // Optional regime filter: only fade dips in an uptrend / rips in a downtrend.
-        let long_regime_ok = !self.config.use_trend_filter || bullish_trend;
-        let short_regime_ok = !self.config.use_trend_filter || bearish_trend;
+        let long_regime_ok: bool = !self.config.use_trend_filter || bullish_trend;
+        let short_regime_ok: bool = !self.config.use_trend_filter || bearish_trend;
 
         // Mean-reversion entries: long when oversold (z low), short when overbought (z high).
-        let bullish_cross = long_regime_ok && z_score < self.config.z_entry && rsi_ok_long;
-        let bearish_cross = short_regime_ok && z_score > self.config.short_z_entry && rsi_ok_short;
+        let bullish_cross: bool = long_regime_ok && z_score < self.config.z_entry && rsi_ok_long;
+        let bearish_cross: bool = short_regime_ok && z_score > self.config.short_z_entry && rsi_ok_short;
 
         let no_signal_reason = if self.is_holding_asset {
             "HOLDING_LONG".into()
@@ -434,8 +889,55 @@ impl SpotStrategy {
             return Action::NoSignal;
         }
 
+        // Bid-ask spread confirmation: avoid entries during wide spreads
+        if !self.spread_confirms() {
+            return Action::NoSignal;
+        }
+
+        // Time-of-day pattern confirmation: avoid trading during low-liquidity hours
+        if !self.time_of_day_confirms() {
+            return Action::NoSignal;
+        }
+
+        // Fear & Greed Index confirmation: avoid longs during extreme greed
+        if !self.fear_greed_confirms(true) {
+            return Action::NoSignal;
+        }
+
+        // Daily limits check: stop trading if daily loss limit exceeded
+        if !self.check_daily_limits() {
+            return Action::NoSignal;
+        }
+
+        // BTC circuit-breaker: block entries when BTC is crashing to reduce
+        // drawdown during market-wide sell-offs.
+        if !self.btc_circuit_breaker_confirms() {
+            return Action::NoSignal;
+        }
+
         let stop_distance = atr_value * self.config.atr_multiplier;
-        let risk_amount = self.current_equity * self.config.default_risk_per_trade_pct;
+        
+        // Volatility-adjusted position sizing with regime detection
+        // Calculate ATR as percentage of price
+        let atr_pct = (atr_value / current_price) * 100.0;
+        
+        // Base risk amount with adaptive adjustment based on recent performance
+        let base_risk_amount = self.current_equity * self.get_adaptive_risk_per_trade();
+        
+        // Volatility adjustment factor: higher ATR = smaller position
+        // Normalize ATR around 2% (typical for crypto)
+        let volatility_factor = 2.0 / atr_pct.max(0.5); // Cap at 0.5% minimum ATR
+        let volatility_factor = volatility_factor.min(2.0).max(0.5); // Clamp between 0.5x and 2x
+        
+        // Regime-based adjustment
+        let regime_factor = match self.current_regime {
+            VolatilityRegime::Low => 1.2,    // Increase position in low vol
+            VolatilityRegime::Normal => 1.0,  // Standard risk
+            VolatilityRegime::High => 0.7,    // Reduce position in high vol
+        };
+        
+        let risk_amount = base_risk_amount * volatility_factor * regime_factor;
+        
         // Size off the stop that will actually trigger first: the tighter of the ATR
         // stop and the hard panic stop. Otherwise, for coins whose ATR stop is wider
         // than panic_stop_loss_pct, the panic stop fires first and the realised loss
@@ -444,11 +946,28 @@ impl SpotStrategy {
         let position_usdt =
             (risk_amount / (risk_distance / current_price)).min(self.wallet.usdt_balance * 0.98);
 
+        // Check position size limit (safety feature for live trading)
+        if !self.check_position_size_limit(position_usdt) {
+            return Action::NoSignal;
+        }
+
         if position_usdt < self.wallet.filters.min_notional {
             return Action::NoSignal;
         }
 
-        if let Some(executed_price) = self.wallet.buy(current_price, position_usdt, true) {
+        // Calculate split orders if enabled
+        let order_sizes: Vec<f64> = self.calculate_split_orders(position_usdt);
+        
+        // Execute orders (in backtesting, we simulate as single order for simplicity)
+        // In live trading, this would execute multiple smaller orders
+        let total_executed_usdt: f64 = if order_sizes.len() > 1 && self.log_debug() {
+            println!("[ORDER-SPLIT] Executing {} split orders", order_sizes.len());
+            order_sizes.iter().sum()
+        } else {
+            position_usdt
+        };
+
+        if let Some(executed_price) = self.wallet.buy(current_price, total_executed_usdt, true) {
             self.is_holding_asset = true;
             self.buy_price = executed_price;
             self.highest_price = executed_price;
@@ -493,14 +1012,63 @@ impl SpotStrategy {
             return Action::NoSignal;
         }
 
+        // Bid-ask spread confirmation: avoid entries during wide spreads
+        if !self.spread_confirms() {
+            return Action::NoSignal;
+        }
+
+        // Time-of-day pattern confirmation: avoid trading during low-liquidity hours
+        if !self.time_of_day_confirms() {
+            return Action::NoSignal;
+        }
+
+        // Fear & Greed Index confirmation: avoid shorts during extreme fear
+        if !self.fear_greed_confirms(false) {
+            return Action::NoSignal;
+        }
+
+        // Daily limits check: stop trading if daily loss limit exceeded
+        if !self.check_daily_limits() {
+            return Action::NoSignal;
+        }
+
+        // BTC circuit-breaker: block entries when BTC is crashing to reduce
+        // drawdown during market-wide sell-offs.
+        if !self.btc_circuit_breaker_confirms() {
+            return Action::NoSignal;
+        }
+
         let stop_distance = atr_value * self.config.short_stop_atr_mult;
+        
+        // Volatility-adjusted position sizing with regime detection (same as long entries)
+        let atr_pct = (atr_value / current_price) * 100.0;
+        
+        // Base risk amount with adaptive adjustment based on recent performance
+        let base_risk_amount = self.current_equity * self.get_adaptive_risk_per_trade();
+        
+        let volatility_factor = 2.0 / atr_pct.max(0.5);
+        let volatility_factor = volatility_factor.min(2.0).max(0.5);
+        
+        // Regime-based adjustment
+        let regime_factor = match self.current_regime {
+            VolatilityRegime::Low => 1.2,
+            VolatilityRegime::Normal => 1.0,
+            VolatilityRegime::High => 0.7,
+        };
+        
+        let risk_amount = base_risk_amount * volatility_factor * regime_factor;
+        
         // Size off the tighter of the ATR stop and the hard panic stop (see
         // try_enter_position), and cap the reserved margin to the available wallet
         // balance so a tiny ATR can't reserve more collateral than we have.
-        let risk_distance = self.effective_stop_distance(current_price, stop_distance);
-        let margin_usdt = ((self.current_equity * self.config.default_risk_per_trade_pct)
-            / (risk_distance / current_price))
+        let risk_distance: f64 = self.effective_stop_distance(current_price, stop_distance);
+        let margin_usdt = (risk_amount / (risk_distance / current_price))
             .min(self.wallet.usdt_balance * 0.98);
+
+        // Check position size limit (safety feature for live trading)
+        if !self.check_position_size_limit(margin_usdt) {
+            return Action::NoSignal;
+        }
 
         if margin_usdt < self.wallet.filters.min_notional {
             return Action::NoSignal;
@@ -524,8 +1092,8 @@ impl SpotStrategy {
     }
 
     fn execute_short_exit(&mut self, exit_price: f64, reason: ExitReason) -> Action {
-        let pnl_pct = (self.short_entry_price - exit_price) / self.short_entry_price * 100.0;
-        let pnl_usdt = self.short_margin_usdt * (pnl_pct / 100.0);
+        let pnl_pct: f64 = (self.short_entry_price - exit_price) / self.short_entry_price * 100.0;
+        let pnl_usdt: f64 = self.short_margin_usdt * (pnl_pct / 100.0);
 
         self.wallet.usdt_balance += self.short_margin_usdt + pnl_usdt;
 
@@ -549,7 +1117,7 @@ impl SpotStrategy {
 
         // 1. Stop-loss: whichever stop is closer to entry (lower price for a short)
         //    is hit first as price rises, so exit there and book that smaller loss.
-        let stop_price = if self.short_panic_price > 0.0 {
+        let stop_price: f64 = if self.short_panic_price > 0.0 {
             self.short_stop_price.min(self.short_panic_price)
         } else {
             self.short_stop_price
@@ -707,11 +1275,15 @@ impl SpotStrategy {
         // is *closer to entry* (higher price for a long) is hit first as price falls,
         // so exit there and book that (smaller) loss. Booking the farther stop when
         // both are breached in one candle overstates the loss.
-        let stop_price = self.initial_stop_price.max(self.panic_stop_price);
+        let stop_price = if self.use_dynamic_trailing_stop && self.dynamic_trailing_stop > 0.0 {
+            self.dynamic_trailing_stop.max(self.panic_stop_price)
+        } else {
+            self.initial_stop_price.max(self.panic_stop_price)
+        };
         if stop_price > 0.0 && check_low <= stop_price {
-            let reason = if self.panic_stop_price > 0.0
-                && self.panic_stop_price >= self.initial_stop_price
-            {
+            let reason = if self.use_dynamic_trailing_stop && self.dynamic_trailing_stop > 0.0 && stop_price == self.dynamic_trailing_stop {
+                ExitReason::TrailingStop
+            } else if self.panic_stop_price > 0.0 && self.panic_stop_price >= self.initial_stop_price {
                 ExitReason::PanicStop
             } else {
                 ExitReason::InitialStop
@@ -770,16 +1342,31 @@ impl SpotStrategy {
                 );
             }
 
+            // Record trade result for adaptive parameter tuning
+            self.record_trade_result(profit_percent / 100.0); // Convert to decimal
+
             // Save before reset
-            let ep = self.buy_price;
-            let bars = self.bars_in_position;
-            let entry_eq = self.entry_equity;
+            let ep: f64 = self.buy_price;
+            let bars: usize = self.bars_in_position;
+            let entry_eq: f64 = self.entry_equity;
 
             self.update_equity_curve(market_price, phase);
             self.apply_exit_cooldown(reason, profit_percent);
             self.reset_position_state();
 
-            let pnl_usdt = self.current_equity - entry_eq;
+            let pnl_usdt: f64 = self.current_equity - entry_eq;
+            
+            // Update daily PnL tracking
+            self.daily_pnl += pnl_usdt;
+            self.daily_trade_count += 1;
+            
+            if self.log_debug() {
+                println!(
+                    "[DAILY-PNL] Daily PnL: ${:.2}, Trades: {}, Loss limit: ${:.2}",
+                    self.daily_pnl, self.daily_trade_count, self.daily_loss_limit_usdt
+                );
+            }
+            
             self.push_trade(
                 ep,
                 executed_price,
@@ -819,6 +1406,7 @@ impl SpotStrategy {
         self.initial_stop_price = 0.0;
         self.panic_stop_price = 0.0;
         self.target_price = 0.0;
+        self.dynamic_trailing_stop = 0.0;
     }
 
     fn position_type(&self) -> PositionType {
@@ -867,10 +1455,10 @@ impl SpotStrategy {
     // ── backtest reporting ───────────────────────────────────────────────────
 
     pub fn compute_backtest_result(&self, last_price: f64, csv_file: &str) -> BacktestResult {
-        let total_trades = self.trade_history.len();
-        let initial_capital = self.initial_capital;
-        let final_equity = self.mark_to_market_equity(last_price);
-        let max_drawdown = self.calculate_max_drawdown();
+        let total_trades: usize = self.trade_history.len();
+        let initial_capital: f64 = self.initial_capital;
+        let final_equity: f64 = self.mark_to_market_equity(last_price);
+        let max_drawdown: f64 = self.calculate_max_drawdown();
 
         if total_trades == 0 {
             return BacktestResult {
@@ -918,9 +1506,9 @@ impl SpotStrategy {
             .iter()
             .map(|t| t.pnl_pct / 100.0)
             .collect();
-        let n = returns.len() as f64;
-        let mean_ret = returns.iter().sum::<f64>() / n;
-        let variance = if n > 1.0 {
+        let n: f64 = returns.len() as f64;
+        let mean_ret: f64 = returns.iter().sum::<f64>() / n;
+        let variance: f64 = if n > 1.0 {
             returns.iter().map(|r| (r - mean_ret).powi(2)).sum::<f64>() / (n - 1.0)
         } else {
             0.0
@@ -935,20 +1523,20 @@ impl SpotStrategy {
             0.0
         };
 
-        let total_pnl_pct = if initial_capital > 0.0 {
+        let total_pnl_pct: f64 = if initial_capital > 0.0 {
             (final_equity - initial_capital) / initial_capital * 100.0
         } else {
             0.0
         };
 
-        let recovery_factor = if max_drawdown.abs() > 0.0 {
+        let recovery_factor: f64 = if max_drawdown.abs() > 0.0 {
             total_pnl_pct.abs() / max_drawdown.abs()
         } else {
             0.0
         };
 
         let mut max_consecutive_losses = 0usize;
-        let mut streak = 0usize;
+        let mut streak: usize = 0usize;
         for t in &self.trade_history {
             if t.pnl_usdt < 0.0 {
                 streak += 1;
@@ -983,18 +1571,18 @@ impl SpotStrategy {
             println!("No trades were executed.");
             return;
         }
-        let long_n = self
+        let long_n: usize = self
             .trade_history
             .iter()
             .filter(|t| t.side == "LONG")
             .count();
-        let short_n = self
+        let short_n: usize = self
             .trade_history
             .iter()
             .filter(|t| t.side == "SHORT")
             .count();
-        let total = self.trade_history.len();
-        let wins = self
+        let total: usize = self.trade_history.len();
+        let wins: usize = self
             .trade_history
             .iter()
             .filter(|t| t.pnl_usdt > 0.0)
@@ -1027,6 +1615,61 @@ impl SpotStrategy {
             self.mark_to_market_equity(last_price)
         );
         println!("==============================\n");
+    }
+
+    /// Create a metrics snapshot for Prometheus export.
+    pub fn to_metrics_snapshot(&self, current_price: f64) -> crate::metrics::SymbolSnapshot {
+        let equity: f64 = self.mark_to_market_equity(current_price);
+        let realized_pnl_usdt: f64 = self.trade_history.iter().map(|t| t.pnl_usdt).sum();
+        let pnl_pct: f64 = if self.initial_capital > 0.0 {
+            (equity - self.initial_capital) / self.initial_capital * 100.0
+        } else {
+            0.0
+        };
+        let drawdown_pct: f64 = if self.peak_equity > 0.0 {
+            (self.peak_equity - equity) / self.peak_equity * 100.0
+        } else {
+            0.0
+        };
+        let position_side: i64 = if self.is_short {
+            -1
+        } else if self.is_holding_asset {
+            1
+        } else {
+            0
+        };
+        let unrealized_pnl_usdt = if self.is_holding_asset {
+            (current_price - self.buy_price) / self.buy_price * self.wallet.crypto_balance * current_price
+        } else if self.is_short {
+            self.short_unrealized_pnl_usdt(current_price)
+        } else {
+            0.0
+        };
+        let atr_pct: f64 = if current_price > 0.0 {
+            (self.last_atr_value / current_price) * 100.0
+        } else {
+            0.0
+        };
+
+        crate::metrics::SymbolSnapshot {
+            symbol: self.symbol.clone(),
+            equity,
+            realized_pnl_usdt,
+            pnl_pct,
+            drawdown_pct,
+            rsi: self.last_rsi_value,
+            z_score: 0.0, // Would need to compute from current state
+            atr: self.last_atr_value,
+            atr_pct,
+            trade_count: self.trade_history.len() as i64,
+            unrealized_pnl_usdt,
+            position_side,
+            wallet_usdt: self.wallet.usdt_balance,
+            last_price: current_price,
+            peak_equity: self.peak_equity,
+            candle_count: self.loop_count as i64,
+            drawdown_stop_active: self.drawdown_stop_active,
+        }
     }
 }
 
@@ -1068,8 +1711,39 @@ impl TradingStrategy for SpotStrategy {
         self.trade_history.len()
     }
 
+    fn latest_indicators(&self) -> (f64, f64, f64, f64) {
+        let atr_pct: f64 = if self.last_atr_value > 0.0 { self.last_atr_value / 100.0 } else { 0.0 };
+        (self.last_rsi_value, 0.0, self.last_atr_value, atr_pct)
+    }
+
+    fn equity_state(&self, current_price: f64) -> (f64, f64, f64) {
+        let equity: f64 = self.mark_to_market_equity(current_price);
+        let dd: f64 = if self.peak_equity > 0.0 {
+            (self.peak_equity - equity) / self.peak_equity * 100.0
+        } else {
+            0.0
+        };
+        (equity, self.peak_equity, dd)
+    }
+
+    fn position_side_int(&self) -> i64 {
+        if self.is_holding_asset { 1 } else if self.is_short { -1 } else { 0 }
+    }
+
+    fn wallet_usdt_balance(&self) -> f64 {
+        self.wallet.usdt_balance
+    }
+
     fn set_order_book_imbalance(&mut self, obi: f64) {
         self.latest_obi = Some(obi);
+    }
+
+    fn update_btc_price(&mut self, btc_price: f64) {
+        self.update_btc_price(btc_price);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn on_tick(&mut self, current_price: f64) {
@@ -1096,13 +1770,16 @@ impl TradingStrategy for SpotStrategy {
     }
 
     fn on_candle_close(&mut self, candle: &Candle) {
-        let current_price = candle.close;
+        let current_price: f64 = candle.close;
         // NOTE: loop_count is incremented inside `update_indicators` below; do not
         // increment it here too or the warm-up period completes twice as fast.
 
         // Update the higher-timeframe trend every base candle (also in backtests),
         // before any early return, so HTF aggregation stays aligned with the data.
         self.update_htf_trend(current_price);
+        
+        // Update 4H timeframe trend for additional confirmation
+        self.update_4h_trend(current_price);
 
         self.price_history.push_back(current_price);
         if self.price_history.len() > self.config.warmup_period() {
@@ -1112,11 +1789,11 @@ impl TradingStrategy for SpotStrategy {
             return;
         }
 
-        let ema_value = self.update_ema(current_price);
-        let z_window = self.config.z_score_period;
-        let z_score_sma = self.calculate_sma(z_window);
-        let z_score_std = self.calculate_std_dev(z_window, z_score_sma);
-        let z_score = if z_score_std > 0.0 {
+        let ema_value: f64 = self.update_ema(current_price);
+        let z_window: usize = self.config.z_score_period;
+        let z_score_sma: f64 = self.calculate_sma(z_window);
+        let z_score_std: f64 = self.calculate_std_dev(z_window, z_score_sma);
+        let z_score: f64 = if z_score_std > 0.0 {
             (current_price - z_score_sma) / z_score_std
         } else {
             0.0
@@ -1141,10 +1818,20 @@ impl TradingStrategy for SpotStrategy {
 
         self.last_atr_value = atr_value;
         self.last_rsi_value = rsi_value;
+        
+        // Update volatility regime detection
+        self.update_volatility_regime(atr_value, current_price);
+        
+        // Adjust parameters based on current volatility regime
+        self.adjust_parameters_for_regime();
+        
+        // Update dynamic trailing stop for open positions
+        self.update_dynamic_trailing_stop(current_price, atr_value);
+        
         let in_cooldown = self.cooldown_bars_remaining > 0;
 
         // Regime uses the EMA cross: trend_value (fast EMA) vs macro_ema_value (slow EMA).
-        let signal = self.compute_signal_state(
+        let signal: SignalState = self.compute_signal_state(
             current_price,
             z_score,
             trend_value,
@@ -1155,7 +1842,7 @@ impl TradingStrategy for SpotStrategy {
             vol_sma_value,
         );
 
-        let mut action = Action::NoSignal;
+        let mut action: Action = Action::NoSignal;
 
         // ── long exit check ──────────────────────────────────────────────────
         if self.is_holding_asset {
@@ -1203,17 +1890,17 @@ impl TradingStrategy for SpotStrategy {
         }
 
         // ── build and send log entry ─────────────────────────────────────────
-        let atr_pct = if current_price > 0.0 {
+        let atr_pct: f64 = if current_price > 0.0 {
             atr_value / current_price * 100.0
         } else {
             0.0
         };
-        let price_vs_sma_pct = if z_score_sma != 0.0 {
+        let price_vs_sma_pct: f64 = if z_score_sma != 0.0 {
             (current_price - z_score_sma) / z_score_sma * 100.0
         } else {
             0.0
         };
-        let price_vs_ema_pct = if ema_value != 0.0 {
+        let price_vs_ema_pct: f64 = if ema_value != 0.0 {
             (current_price - ema_value) / ema_value * 100.0
         } else {
             0.0
@@ -1230,8 +1917,8 @@ impl TradingStrategy for SpotStrategy {
             };
             (u, p)
         } else if self.is_short {
-            let u = self.short_unrealized_pnl_usdt(current_price);
-            let p = if self.short_margin_usdt > 0.0 {
+            let u: f64 = self.short_unrealized_pnl_usdt(current_price);
+            let p: f64 = if self.short_margin_usdt > 0.0 {
                 u / self.short_margin_usdt * 100.0
             } else {
                 0.0
@@ -1241,20 +1928,20 @@ impl TradingStrategy for SpotStrategy {
             (0.0, 0.0)
         };
 
-        let drawdown_pct = if self.peak_equity > 0.0 {
+        let drawdown_pct: f64 = if self.peak_equity > 0.0 {
             (self.peak_equity - self.current_equity) / self.peak_equity * 100.0
         } else {
             0.0
         };
 
-        let total_pnl_usdt = self.current_equity - self.initial_capital;
-        let total_pnl_pct = if self.initial_capital > 0.0 {
+        let total_pnl_usdt: f64 = self.current_equity - self.initial_capital;
+        let total_pnl_pct: f64 = if self.initial_capital > 0.0 {
             total_pnl_usdt / self.initial_capital * 100.0
         } else {
             0.0
         };
 
-        let position_exposure_usdt = if self.is_holding_asset {
+        let position_exposure_usdt: f64 = if self.is_holding_asset {
             self.wallet.crypto_balance.max(0.0) * current_price
         } else if self.is_short {
             self.short_margin_usdt
@@ -1262,7 +1949,7 @@ impl TradingStrategy for SpotStrategy {
             0.0
         };
 
-        let position_type = self.position_type();
+        let position_type: PositionType = self.position_type();
 
         let log_entry = CandleLogEntry {
             bar_index: self.loop_count,

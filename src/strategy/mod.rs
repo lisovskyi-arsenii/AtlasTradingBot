@@ -27,6 +27,20 @@ pub trait TradingStrategy {
     fn final_equity(&self, current_price: f64) -> f64;
     fn total_trades(&self) -> usize;
 
+    /// Latest indicator values for metrics reporting.
+    /// Returns (rsi, z_score_placeholder, atr, last_atr_pct).
+    /// z_score is not stored on the trait; strategies can override.
+    fn latest_indicators(&self) -> (f64, f64, f64, f64) { (0.0, 0.0, 0.0, 0.0) }
+    /// Current equity, peak equity, current drawdown %.
+    fn equity_state(&self, current_price: f64) -> (f64, f64, f64) {
+        let eq = self.final_equity(current_price);
+        (eq, eq, 0.0)
+    }
+    /// Position side as integer: 0=flat, 1=long, -1=short.
+    fn position_side_int(&self) -> i64 { 0 }
+    /// Wallet USDT balance.
+    fn wallet_usdt_balance(&self) -> f64 { 0.0 }
+
     fn on_tick(&mut self, current_price: f64);
     fn on_candle_close(&mut self, candle: &Candle);
 
@@ -34,6 +48,14 @@ pub trait TradingStrategy {
     /// Default is a no-op so strategies that ignore microstructure (and the
     /// backtest path, which has no order book) need not implement it.
     fn set_order_book_imbalance(&mut self, _obi: f64) {}
+
+    /// Feed the latest BTC price into the strategy for circuit-breaker filtering.
+    /// Default is a no-op so strategies that don't use the BTC filter need not implement it.
+    fn update_btc_price(&mut self, _btc_price: f64) {}
+
+    /// Return a reference to self as `Any` for downcasting.
+    /// This enables accessing concrete strategy methods from trait objects.
+    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Feed one closed candle through all indicators.
     ///

@@ -12,6 +12,7 @@ pub struct BotConfig {
     pub symbol: String,
     pub leverage: f64,
     pub margin: f64,
+    pub use_testnet: bool,
     pub strategy: StrategyConfig,
     pub runtime: RuntimeConfig,
 }
@@ -31,6 +32,8 @@ pub struct RuntimeConfig {
     pub live_log_path: String,
     pub candle_timeframe_seconds: u64,
     pub poll_interval_seconds: u64,
+    /// Port for the Prometheus /metrics HTTP endpoint. 0 disables.
+    pub metrics_port: u16,
 }
 
 fn default_backtest_symbols() -> Vec<String> {
@@ -52,6 +55,7 @@ impl Default for RuntimeConfig {
             live_log_path: "trading_bot.csv".to_string(),
             candle_timeframe_seconds: 15 * 60,
             poll_interval_seconds: 3,
+            metrics_port: 9100,
         }
     }
 }
@@ -64,6 +68,7 @@ struct RuntimeFileConfig {
     pub live_log_path: Option<String>,
     pub candle_timeframe_seconds: Option<u64>,
     pub poll_interval_seconds: Option<u64>,
+    pub metrics_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -73,6 +78,7 @@ struct BotFileConfig {
     pub symbol: Option<String>,
     pub leverage: Option<f64>,
     pub margin: Option<f64>,
+    pub use_testnet: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -97,6 +103,7 @@ impl BotConfig {
             symbol: String::new(),
             leverage: 10.0,
             margin: 1000.0,
+            use_testnet: false,
             strategy: StrategyConfig::default(),
             runtime: RuntimeConfig::default(),
         };
@@ -194,6 +201,10 @@ impl BotConfig {
             self.margin = margin;
         }
 
+        if let Some(use_testnet) = file_config.bot.use_testnet {
+            self.use_testnet = use_testnet;
+        }
+
         self.strategy = StrategyConfig::from_file(file_config.strategy);
 
         if let Some(backtest_csv_path) = file_config.runtime.backtest_csv_path {
@@ -220,6 +231,10 @@ impl BotConfig {
 
         if let Some(poll_interval_seconds) = file_config.runtime.poll_interval_seconds {
             self.runtime.poll_interval_seconds = poll_interval_seconds.max(1);
+        }
+
+        if let Some(metrics_port) = file_config.runtime.metrics_port {
+            self.runtime.metrics_port = metrics_port;
         }
     }
 
@@ -334,6 +349,7 @@ impl BotConfig {
             symbol: String::new(),
             leverage: 1.0,
             margin: 1000.0,
+            use_testnet: false,
             strategy: StrategyConfig::default(),
             runtime: RuntimeConfig::default(),
         }

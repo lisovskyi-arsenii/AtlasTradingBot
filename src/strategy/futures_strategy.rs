@@ -188,5 +188,9 @@ impl TradingStrategy for FuturesTradingStrategy {
     fn on_candle_close(&mut self, _candle: &Candle) {
         // TODO: Implement futures-specific logic
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 

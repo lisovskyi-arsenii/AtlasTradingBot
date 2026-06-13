@@ -52,6 +52,14 @@ pub struct StrategyConfig {
     pub mtf_bars: usize,
     /// EMA period (in HTF candles) used to judge the higher-timeframe trend.
     pub mtf_ema_period: usize,
+    /// BTC circuit-breaker filter: when on, block new entries when BTC is crashing.
+    /// Backtestable: uses BTC price data from the same timeframe.
+    pub use_btc_circuit_breaker: bool,
+    /// BTC price change threshold (negative) to trigger circuit-breaker.
+    /// e.g. -0.03 means block entries if BTC drops 3% or more in the lookback period.
+    pub btc_crash_threshold_pct: f64,
+    /// Lookback period (in bars) to measure BTC price change for circuit-breaker.
+    pub btc_crash_lookback_bars: usize,
 }
 
 impl Default for StrategyConfig {
@@ -91,6 +99,9 @@ impl Default for StrategyConfig {
             use_mtf_filter: false,
             mtf_bars: 4,
             mtf_ema_period: 200,
+            use_btc_circuit_breaker: false,
+            btc_crash_threshold_pct: -0.03,
+            btc_crash_lookback_bars: 24,
         }
     }
 }
@@ -146,6 +157,9 @@ impl StrategyConfig {
             use_mtf_filter: self.use_mtf_filter,
             mtf_bars: self.mtf_bars.max(1),
             mtf_ema_period: self.mtf_ema_period.max(1),
+            use_btc_circuit_breaker: self.use_btc_circuit_breaker,
+            btc_crash_threshold_pct: self.btc_crash_threshold_pct,
+            btc_crash_lookback_bars: self.btc_crash_lookback_bars.max(1),
         }
         .with_fallbacks(defaults)
     }
@@ -206,6 +220,9 @@ pub struct StrategyFileConfig {
     pub use_mtf_filter: Option<bool>,
     pub mtf_bars: Option<usize>,
     pub mtf_ema_period: Option<usize>,
+    pub use_btc_circuit_breaker: Option<bool>,
+    pub btc_crash_threshold_pct: Option<f64>,
+    pub btc_crash_lookback_bars: Option<usize>,
 }
 
 impl StrategyConfig {
@@ -268,6 +285,9 @@ impl StrategyConfig {
             use_mtf_filter: file.use_mtf_filter.unwrap_or(defaults.use_mtf_filter),
             mtf_bars: file.mtf_bars.unwrap_or(defaults.mtf_bars),
             mtf_ema_period: file.mtf_ema_period.unwrap_or(defaults.mtf_ema_period),
+            use_btc_circuit_breaker: file.use_btc_circuit_breaker.unwrap_or(defaults.use_btc_circuit_breaker),
+            btc_crash_threshold_pct: file.btc_crash_threshold_pct.unwrap_or(defaults.btc_crash_threshold_pct),
+            btc_crash_lookback_bars: file.btc_crash_lookback_bars.unwrap_or(defaults.btc_crash_lookback_bars),
         }
         .sanitized()
     }

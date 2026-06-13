@@ -1,0 +1,55 @@
+# docker-compose.yml — Prometheus + Grafana for AtlasTradingBot monitoring.
+#
+# Usage:
+#   cd monitoring
+#   docker compose up -d
+#
+# Then open:
+#   Grafana:    http://localhost:3000  (admin / atlas_bot)
+#   Prometheus: http://localhost:9090
+#
+# The bot exposes metrics at http://<host>:9100/metrics (see config.toml).
+#
+# On Linux, Docker cannot resolve host.docker.internal by default.
+# We add extra_hosts below to fix this. If your bot runs on a different
+# machine, edit monitoring/prometheus/prometheus.yml accordingly.
+
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: atlas-prometheus
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=30d'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: atlas-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=atlas_bot
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

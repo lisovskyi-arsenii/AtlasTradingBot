@@ -4,6 +4,8 @@ exchange = "binance"
 symbol = "BTCUSDT"
 leverage = 10.0
 margin = 1000.0
+# Use testnet for testing with fake money (set to false for real trading)
+use_testnet = true
 
 [strategy]
 # Indicator periods
@@ -19,7 +21,7 @@ ema_period = 200
 
 # Entry / exit thresholds
 z_entry = -2.0
-short_z_entry = 0.25
+short_z_entry = 0.3
 atr_multiplier = 3.0
 short_stop_atr_mult = 2.0
 short_tp_atr_mult = 4.0
@@ -36,7 +38,7 @@ min_bars_in_position = 5
 # 1y/1h dataset (pruned symbol set below). 0.006 -> ~+13.8% / worst DD ~-9.5%.
 # Drop to 0.005 for more buffer (~+11.5% / -8.2%); 0.007 reaches ~+16% but
 # breaches 10% DD. Profit and drawdown scale together — this is the main lever.
-default_risk_per_trade_pct = 0.006
+default_risk_per_trade_pct = 0.010
 max_strategy_drawdown_pct = 12.0
 
 # Long/short and hard risk controls
@@ -75,20 +77,26 @@ use_mtf_filter = false
 mtf_bars = 12
 mtf_ema_period = 50
 
+# --- BTC circuit-breaker filter ---
+# Blocks new entries when BTC is crashing (price drops below threshold over lookback period).
+# Designed to reduce drawdown during market-wide sell-offs. Fully backtestable.
+# Default: off (set to true to enable). Threshold: -0.03 = -3% drop over lookback period.
+use_btc_circuit_breaker = false
+btc_crash_threshold_pct = -0.03
+btc_crash_lookback_bars = 24
+
 [runtime]
-backtest_csv_path = "BTCUSDT-1h-2026-05.csv"
-# Symbols traded in batch backtest / live candidates. DOGEUSDT and BABYUSDT were
-# dropped: lowest risk-adjusted return on the 1y/1h dataset (Recovery 0.20 / 0.46,
-# i.e. they ate most of the drawdown budget for little profit). Removing them lets
-# the rest run at higher risk while keeping worst DD < 10%. NOTE: symbol ranking
-# is window-dependent — re-check before trusting this list on fresh data.
+backtest_csv_path = "BTCUSDT-1h-2026-01-01-2026-05-31.csv"
+# Symbols traded in batch backtest / live candidates. Using larger 5-month datasets
+# for more statistically significant backtest results (3600 candles vs 1000).
 backtest_symbols = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
-    "TRXUSDT", "PEPEUSDT", "SUIUSDT", "XLMUSDT",
+    "ETHUSDT", "XRPUSDT", "TRXUSDT", "PEPEUSDT", "DOGEUSDT", "SOLUSDT", "SUIUSDT",
 ]
 live_log_path = "trading_bot.csv"
 candle_timeframe_seconds = 900
 poll_interval_seconds = 3
+# Port for Prometheus metrics endpoint (0 disables). Default: 9100
+metrics_port = 9100
 
 # Relative capital weights per symbol. Total capital is unchanged; weights only
 # redistribute it. A symbol not listed defaults to weight 1.0. Empty/omitted =
@@ -96,9 +104,14 @@ poll_interval_seconds = 3
 # overfitting — symbol ranks are unstable across periods. Tune deliberately.
 # NOTE: this is a sub-table, so it MUST stay at the very end of [runtime]
 # (any plain keys after it would be parsed as weights and break the config).
-# [runtime.symbol_weights]
-# ETHUSDT = 2.0
-# XRPUSDT = 1.5
-# BTCUSDT = 0.5
-# XLMUSDT = 0.5
-
+[runtime.symbol_weights]
+ETHUSDT = 2.0
+XRPUSDT = 2.0
+TRXUSDT = 2.0
+PEPEUSDT = 1.5
+DOGEUSDT = 1.5
+SOLUSDT = 0.8
+SUIUSDT = 0.8
+BTCUSDT = 0.3
+XLMUSDT = 0.2
+BABYUSDT = 0.2
