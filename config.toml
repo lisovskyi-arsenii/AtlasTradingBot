@@ -60,6 +60,21 @@ use_order_book_filter = false
 obi_threshold = 0.15
 obi_depth_levels = 5
 
+# --- Multi-timeframe (MTF) macro trend filter ---
+# Aggregates the base 1h candles into a higher-timeframe (HTF) candle and only
+# allows longs when the HTF trend is up (HTF close > HTF EMA) and shorts when it
+# is down. Fully backtestable (built from the same OHLC data).
+# Off by default: this is a MEAN-REVERSION (counter-trend) strategy, so gating on
+# the macro trend trims edge. Backtest (1y/1h, pruned 8 symbols, risk 0.006):
+#   off            -> +13.84% / DD -9.51%  (best return)
+#   bars=12 ema=50 -> +13.11% / DD -8.98%  (near-same return, smoother / lower DD)
+#   bars=4  ema=200-> +12.75% / DD -9.37%
+# Turn on only if you prefer the lower-drawdown profile. mtf_bars is in base
+# candles (12 = 12h on 1h data); mtf_ema_period is in HTF candles.
+use_mtf_filter = false
+mtf_bars = 12
+mtf_ema_period = 50
+
 [runtime]
 backtest_csv_path = "BTCUSDT-1h-2026-05.csv"
 # Symbols traded in batch backtest / live candidates. DOGEUSDT and BABYUSDT were

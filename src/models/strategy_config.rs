@@ -42,6 +42,16 @@ pub struct StrategyConfig {
     pub obi_threshold: f64,
     /// How many price levels of the partial-depth stream to aggregate for the OBI.
     pub obi_depth_levels: usize,
+    /// Multi-timeframe macro filter: when on, a long is only allowed when the
+    /// higher-timeframe trend is bullish (HTF close > HTF EMA) and a short only
+    /// when it is bearish. Backtestable: the HTF candle is aggregated from the
+    /// base 1h candles, so it works on the same OHLC data.
+    pub use_mtf_filter: bool,
+    /// How many base candles form one higher-timeframe candle (e.g. 4 => 4h on
+    /// 1h data).
+    pub mtf_bars: usize,
+    /// EMA period (in HTF candles) used to judge the higher-timeframe trend.
+    pub mtf_ema_period: usize,
 }
 
 impl Default for StrategyConfig {
@@ -78,6 +88,9 @@ impl Default for StrategyConfig {
             use_order_book_filter: false,
             obi_threshold: 0.15,
             obi_depth_levels: 5,
+            use_mtf_filter: false,
+            mtf_bars: 4,
+            mtf_ema_period: 200,
         }
     }
 }
@@ -130,6 +143,9 @@ impl StrategyConfig {
             use_order_book_filter: self.use_order_book_filter,
             obi_threshold: self.obi_threshold,
             obi_depth_levels: self.obi_depth_levels.max(1),
+            use_mtf_filter: self.use_mtf_filter,
+            mtf_bars: self.mtf_bars.max(1),
+            mtf_ema_period: self.mtf_ema_period.max(1),
         }
         .with_fallbacks(defaults)
     }
@@ -187,6 +203,9 @@ pub struct StrategyFileConfig {
     pub use_order_book_filter: Option<bool>,
     pub obi_threshold: Option<f64>,
     pub obi_depth_levels: Option<usize>,
+    pub use_mtf_filter: Option<bool>,
+    pub mtf_bars: Option<usize>,
+    pub mtf_ema_period: Option<usize>,
 }
 
 impl StrategyConfig {
@@ -246,6 +265,9 @@ impl StrategyConfig {
                 .unwrap_or(defaults.use_order_book_filter),
             obi_threshold: file.obi_threshold.unwrap_or(defaults.obi_threshold),
             obi_depth_levels: file.obi_depth_levels.unwrap_or(defaults.obi_depth_levels),
+            use_mtf_filter: file.use_mtf_filter.unwrap_or(defaults.use_mtf_filter),
+            mtf_bars: file.mtf_bars.unwrap_or(defaults.mtf_bars),
+            mtf_ema_period: file.mtf_ema_period.unwrap_or(defaults.mtf_ema_period),
         }
         .sanitized()
     }
