@@ -173,7 +173,7 @@ impl TradingStrategy for FuturesTradingStrategy {
     fn vol_sma(&mut self) -> &mut Sma { &mut self.vol_sma }
     fn warmup_period(&self) -> usize { self.config.warmup_period() }
 
-    fn final_equity(&self, current_price: f64) -> f64 {
+    fn final_equity(&self, _current_price: f64) -> f64 {
         todo!()
     }
 

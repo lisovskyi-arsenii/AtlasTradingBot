@@ -32,7 +32,11 @@ cooldown_bars = 2
 loss_cooldown_bars = 8
 take_profit_cooldown_bars = 3
 min_bars_in_position = 5
-default_risk_per_trade_pct = 0.005
+# Risk per trade. Tuned so the worst single-symbol drawdown stays < 10% on the
+# 1y/1h dataset (pruned symbol set below). 0.006 -> ~+13.8% / worst DD ~-9.5%.
+# Drop to 0.005 for more buffer (~+11.5% / -8.2%); 0.007 reaches ~+16% but
+# breaches 10% DD. Profit and drawdown scale together — this is the main lever.
+default_risk_per_trade_pct = 0.006
 max_strategy_drawdown_pct = 12.0
 
 # Long/short and hard risk controls
@@ -58,11 +62,14 @@ obi_depth_levels = 5
 
 [runtime]
 backtest_csv_path = "BTCUSDT-1h-2026-05.csv"
-# Symbols traded in batch backtest / live candidates. Edit to focus capital on
-# the symbols you want; all of these are net-profitable on the 1y/1h dataset.
+# Symbols traded in batch backtest / live candidates. DOGEUSDT and BABYUSDT were
+# dropped: lowest risk-adjusted return on the 1y/1h dataset (Recovery 0.20 / 0.46,
+# i.e. they ate most of the drawdown budget for little profit). Removing them lets
+# the rest run at higher risk while keeping worst DD < 10%. NOTE: symbol ranking
+# is window-dependent — re-check before trusting this list on fresh data.
 backtest_symbols = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
-    "TRXUSDT", "PEPEUSDT", "SUIUSDT", "BABYUSDT", "XLMUSDT",
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT",
+    "TRXUSDT", "PEPEUSDT", "SUIUSDT", "XLMUSDT",
 ]
 live_log_path = "trading_bot.csv"
 candle_timeframe_seconds = 900
