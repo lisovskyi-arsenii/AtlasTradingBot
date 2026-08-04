@@ -1,0 +1,30 @@
+/target
+*.csv
+
+# Secrets & local overrides — NEVER commit these
+.env
+.env.*
+config.local.toml
+config.*.toml
+!config.toml
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# IDE artifacts
+.idea/
+.vscode/
+
+# Profiling / flamegraph output
+perf.data
+perf.data.old
+flamegraph.svg
+*.folded
+
+# Graphify output (auto-generated)
+graphify-out/
+
+# Temp scan directories
+temp_scan/
