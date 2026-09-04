@@ -10,9 +10,10 @@
 //! * [`BinanceBroker`] — HMAC-signed REST calls to Binance mainnet / testnet
 //!
 //! # Usage
-//! ```no_run
-//! let broker: Arc<dyn ExecutionBroker> = Arc::new(PaperBroker::new(10_000.0));
-//! let ack = broker.place_order(OrderRequest { ... }).await?;
+//! ```ignore
+//! // Illustrative only — see `PaperBroker::new` for the real signature.
+//! let broker: Arc<dyn ExecutionBroker> = Arc::new(PaperBroker::new(10_000.0, "BTCUSDT", CryptoExchange::Binance));
+//! let ack = broker.place_order(OrderRequest { /* ... */ }).await?;
 //! ```
 
 use async_trait::async_trait;

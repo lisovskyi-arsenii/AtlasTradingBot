@@ -1,8 +1,8 @@
-use rusqlite::{params, Connection, Result};
-use std::sync::{Arc, Mutex};
 use std::path::Path;
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{FromRow, SqlitePool};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct PositionState {
     pub symbol: String,
     pub is_holding: bool,
@@ -11,18 +11,34 @@ pub struct PositionState {
     pub qty: f64,
     pub initial_stop_price: f64,
     pub trailing_stop_price: f64,
+    /// `client_id` of the resting exchange-side STOP_LOSS_LIMIT order that
+    /// protects this position, if one has been placed. Strategies never set
+    /// this (they don't know about broker-side orders) — it is filled in by
+    /// `sync_broker_state` in `main.rs` after `place_protective_stop`
+    /// succeeds, and consumed on the next state change to cancel/replace it.
+    pub stop_order_id: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct StateManager {
-    conn: Arc<Mutex<Connection>>,
+    pool: SqlitePool,
 }
 
 impl StateManager {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        
-        conn.execute(
+    pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, sqlx::Error> {
+        let path_str = db_path.as_ref().to_str().unwrap_or("positions.db");
+        let conn_str = if path_str.starts_with("sqlite:") {
+            path_str.to_string()
+        } else {
+            format!("sqlite:{}?mode=rwc", path_str)
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&conn_str)
+            .await?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS positions (
                 symbol TEXT PRIMARY KEY,
                 is_holding BOOLEAN NOT NULL,
@@ -31,21 +47,25 @@ impl StateManager {
                 qty REAL NOT NULL,
                 initial_stop_price REAL NOT NULL,
                 trailing_stop_price REAL NOT NULL,
+                stop_order_id TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
-            [],
-        )?;
+        )
+        .execute(&pool)
+        .await?;
 
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        // Міграція для старих баз (ігноруємо помилку дублікату стовпця)
+        let _ = sqlx::query("ALTER TABLE positions ADD COLUMN stop_order_id TEXT")
+            .execute(&pool)
+            .await;
+
+        Ok(Self { pool })
     }
 
-    pub fn save_position(&self, pos: &PositionState) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO positions (symbol, is_holding, is_short, entry_price, qty, initial_stop_price, trailing_stop_price, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)
+    pub async fn save_position(&self, pos: &PositionState) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO positions (symbol, is_holding, is_short, entry_price, qty, initial_stop_price, trailing_stop_price, stop_order_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)
              ON CONFLICT(symbol) DO UPDATE SET
                 is_holding = excluded.is_holding,
                 is_short = excluded.is_short,
@@ -53,47 +73,41 @@ impl StateManager {
                 qty = excluded.qty,
                 initial_stop_price = excluded.initial_stop_price,
                 trailing_stop_price = excluded.trailing_stop_price,
+                stop_order_id = excluded.stop_order_id,
                 updated_at = CURRENT_TIMESTAMP",
-            params![
-                pos.symbol,
-                pos.is_holding,
-                pos.is_short,
-                pos.entry_price,
-                pos.qty,
-                pos.initial_stop_price,
-                pos.trailing_stop_price
-            ],
-        )?;
+        )
+            .bind(&pos.symbol)
+            .bind(pos.is_holding)
+            .bind(pos.is_short)
+            .bind(pos.entry_price)
+            .bind(pos.qty)
+            .bind(pos.initial_stop_price)
+            .bind(pos.trailing_stop_price)
+            .bind(&pos.stop_order_id)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
-    pub fn load_position(&self, symbol: &str) -> Result<Option<PositionState>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT symbol, is_holding, is_short, entry_price, qty, initial_stop_price, trailing_stop_price 
-             FROM positions WHERE symbol = ?1"
-        )?;
-        
-        let mut rows = stmt.query(params![symbol])?;
-        
-        if let Some(row) = rows.next()? {
-            Ok(Some(PositionState {
-                symbol: row.get(0)?,
-                is_holding: row.get(1)?,
-                is_short: row.get(2)?,
-                entry_price: row.get(3)?,
-                qty: row.get(4)?,
-                initial_stop_price: row.get(5)?,
-                trailing_stop_price: row.get(6)?,
-            }))
-        } else {
-            Ok(None)
-        }
+    pub async fn load_position(&self, symbol: &str) -> Result<Option<PositionState>, sqlx::Error> {
+        let pos = sqlx::query_as::<_, PositionState>(
+            "SELECT symbol, is_holding, is_short, entry_price, qty, initial_stop_price, trailing_stop_price, stop_order_id
+             FROM positions WHERE symbol = ?1",
+        )
+            .bind(symbol)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(pos)
     }
 
-    pub fn delete_position(&self, symbol: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM positions WHERE symbol = ?1", params![symbol])?;
+    pub async fn delete_position(&self, symbol: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM positions WHERE symbol = ?1")
+            .bind(symbol)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 }

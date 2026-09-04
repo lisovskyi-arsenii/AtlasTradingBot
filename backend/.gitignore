@@ -1,6 +1,13 @@
 /target
 *.csv
 
+# Local runtime state (SQLite position/state DB) — differs per machine/run,
+# never something to commit.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Secrets & local overrides — NEVER commit these
 .env
 .env.*
@@ -23,7 +30,7 @@ perf.data.old
 flamegraph.svg
 *.folded
 
-# Graphify output (auto-generated)
+# Graphify output
 graphify-out/
 
 # Temp scan directories

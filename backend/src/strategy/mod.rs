@@ -8,6 +8,21 @@ use ta::{DataItem, Next};
 pub mod spot_strategy;
 pub mod futures_strategy;
 pub mod order_book;
+pub mod risk_gate;
+pub mod entry_filters;
+pub mod reporter;
+pub mod position_manager;
+
+/// Coarse volatility bucket used to scale position sizing (see
+/// `risk_gate::RiskGate::adjust_for_regime`) and, in `SpotStrategy`, gated
+/// entry filters. Lives here (not in `spot_strategy`) because both
+/// `spot_strategy` and `risk_gate` need it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VolatilityRegime {
+    Low,    // ATR < 1.5% of price
+    Normal, // ATR 1.5% - 3% of price
+    High,   // ATR > 3% of price
+}
 
 /// Core interface shared by all strategy implementations.
 ///

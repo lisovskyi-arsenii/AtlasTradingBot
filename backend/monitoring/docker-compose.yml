@@ -2,10 +2,16 @@
 #
 # Usage:
 #   cd monitoring
-#   docker compose up -d
+#   doppler run -- docker compose up -d
+#
+# Requires GF_SECURITY_ADMIN_USER / GF_SECURITY_ADMIN_PASSWORD in the
+# environment (via Doppler — see the secrets setup). Running plain
+# `docker compose up -d` without them starts Grafana with those variables
+# empty, which the grafana image rejects at boot; that's intentional — it
+# should fail loudly rather than fall back to a guessable default.
 #
 # Then open:
-#   Grafana:    http://localhost:3000  (admin / atlas_bot)
+#   Grafana:    http://localhost:3000  (admin / <GF_SECURITY_ADMIN_PASSWORD>)
 #   Prometheus: http://localhost:9090
 #
 # The bot exposes metrics at http://<host>:9100/metrics (see config.toml).
@@ -39,8 +45,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=atlas_bot
+      # Sourced from the environment (Doppler) — never hardcode a real value
+      # here, this file is committed to git.
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:?set GF_SECURITY_ADMIN_USER (e.g. via doppler run)}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:?set GF_SECURITY_ADMIN_PASSWORD (e.g. via doppler run)}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro

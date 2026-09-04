@@ -378,6 +378,7 @@ impl BotConfig {
             leverage: 1.0,
             margin: 1000.0,
             use_testnet: false,
+            execution_mode: ExecutionMode::Paper,
             strategy: StrategyConfig::default(),
             runtime: RuntimeConfig::default(),
         }

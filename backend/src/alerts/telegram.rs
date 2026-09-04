@@ -11,7 +11,8 @@ use reqwest::Client;
 /// Send a Telegram alert. No-ops gracefully if credentials are not configured.
 ///
 /// # Example
-/// ```no_run
+/// ```ignore
+/// // Illustrative only — needs an async context to actually await.
 /// alerts::telegram::send("[ATLAS] Drawdown halt triggered! Equity: $9800").await;
 /// ```
 pub async fn send(text: &str) {

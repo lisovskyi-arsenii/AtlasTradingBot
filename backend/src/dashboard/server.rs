@@ -60,7 +60,6 @@ pub async fn run_dashboard_server(
     println!("[DASHBOARD] Запуск сервера на http://{}", addr);
 
     // 4. Запуск сервера. Використайте `axum::Server` або `tokio::net::TcpListener` (залежно від версії axum).
-    // ... напишіть код запуску тут ...
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -87,7 +86,6 @@ async fn handle_socket(mut socket: WebSocket, mut rx: broadcast::Receiver<Dashbo
     // 3. Відправляємо JSON клієнту: socket.send(Message::Text(json)).await;
     // 4. Обробляємо помилки відключення клієнта.
     
-    // ... напишіть логіку тут ...
     loop {
         let state = match rx.recv().await {
             Ok(state) => state,

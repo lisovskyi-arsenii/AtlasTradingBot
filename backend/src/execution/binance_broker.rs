@@ -15,8 +15,10 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
-use std::time::{SystemTime, UNIX_EPOCH};
-use hmac::{Hmac, Mac};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use axum::http::header;
+use hmac::{Hmac, KeyInit, Mac};
+use serde::Deserialize;
 use sha2::Sha256;
 
 use crate::execution::{
@@ -26,6 +28,7 @@ use crate::execution::{
 
 const MAINNET_BASE: &str = "https://api.binance.com";
 const TESTNET_BASE: &str = "https://testnet.binance.vision";
+const DEFAULT_RECV_WINDOW: u64 = 5000;
 
 /// Binance REST broker.
 ///
@@ -34,7 +37,6 @@ const TESTNET_BASE: &str = "https://testnet.binance.vision";
 /// fail-fast before the bot starts rather than a panic mid-session.
 pub struct BinanceBroker {
     client: Client,
-    api_key: String,
     api_secret: String,
     base_url: &'static str,
 }
@@ -51,9 +53,20 @@ impl BinanceBroker {
             return Err("BINANCE_API_KEY or BINANCE_API_SECRET is empty".to_string());
         }
 
+        let mut default_headers = header::HeaderMap::new();
+        let mut key_val = header::HeaderValue::from_str(&api_key)
+            .map_err(|e| format!("Invalid API key characters: {}", e))?;
+        key_val.set_sensitive(true);
+        default_headers.insert("X-MBX-APIKEY", key_val);
+
+        let client = Client::builder()
+            .default_headers(default_headers)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
         Ok(Self {
-            client: Client::new(),
-            api_key,
+            client,
             api_secret,
             base_url: if use_testnet { TESTNET_BASE } else { MAINNET_BASE },
         })
@@ -95,15 +108,15 @@ impl BinanceBroker {
     fn timestamp_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_millis() as u64
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 
     /// Sign a query string with HMAC-SHA256 using the API secret.
     fn sign(&self, query: &str) -> String {
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
-            .expect("HMAC can accept any key length");
+            .expect("HMAC supports valid key slices");
         mac.update(query.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
@@ -112,9 +125,9 @@ impl BinanceBroker {
     fn signed_query(&self, params: &str) -> String {
         let ts = Self::timestamp_ms();
         let with_ts = if params.is_empty() {
-            format!("timestamp={}", ts)
+            format!("timestamp={}&recvWindow={}", ts, DEFAULT_RECV_WINDOW)
         } else {
-            format!("{}&timestamp={}", params, ts)
+            format!("{}&timestamp={}&recvWindow={}", params, ts, DEFAULT_RECV_WINDOW)
         };
         let sig = self.sign(&with_ts);
         format!("{}&signature={}", with_ts, sig)
@@ -166,7 +179,6 @@ impl BinanceBroker {
         let resp = self
             .client
             .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await
             .map_err(|e| ExecError::Network(e.to_string()))?;
@@ -211,14 +223,6 @@ impl BinanceBroker {
 
 #[async_trait]
 impl ExecutionBroker for BinanceBroker {
-    fn name(&self) -> &'static str {
-        "BinanceBroker"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     async fn place_order(&self, req: OrderRequest) -> Result<OrderAck, ExecError> {
         let side_str = match req.side {
             OrderSide::Buy  => "BUY",
@@ -254,7 +258,6 @@ impl ExecutionBroker for BinanceBroker {
             .with_backoff(|| {
                 self.client
                     .post(&url)
-                    .header("X-MBX-APIKEY", &self.api_key)
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .body(query.clone())
                     .send()
@@ -325,7 +328,6 @@ impl ExecutionBroker for BinanceBroker {
         let resp = self
             .client
             .delete(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await
             .map_err(|e| ExecError::Network(e.to_string()))?;
@@ -348,7 +350,6 @@ impl ExecutionBroker for BinanceBroker {
         let resp = self
             .client
             .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await
             .map_err(|e| ExecError::Network(e.to_string()))?;
@@ -394,7 +395,6 @@ impl ExecutionBroker for BinanceBroker {
         let resp = self
             .client
             .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
             .send()
             .await
             .map_err(|e| ExecError::Network(e.to_string()))?;
@@ -438,5 +438,13 @@ impl ExecutionBroker for BinanceBroker {
         }).collect();
 
         Ok(orders)
+    }
+
+    fn name(&self) -> &'static str {
+        "BinanceBroker"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

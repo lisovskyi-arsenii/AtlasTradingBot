@@ -1,56 +1,41 @@
-pub mod models;
-pub mod network;
-pub mod strategy;
-pub mod utility;
-pub mod spot;
-pub mod futures;
-pub mod logs;
-pub mod metrics;
-pub mod execution;
-pub mod alerts;
-pub mod risk;
-pub mod dashboard;
-
-use crate::execution::binance_broker::BinanceBroker;
-use crate::execution::state::StateManager;
-use crate::execution::reconciliation::reconcile_startup;
+use RustBot::execution::binance_broker::BinanceBroker;
+use RustBot::execution::state::StateManager;
+use RustBot::execution::reconciliation::reconcile_startup;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::alerts::telegram;
-use crate::logs::csv::write_to_csv_file;
-use crate::logs::json::write_to_jsonl_file;
-use crate::models::bot_config::BotConfig;
-use crate::models::candle::Candle;
-use crate::models::candle_log_entry::CandleLogEntry;
-use crate::models::data::{BacktestResult, Mode};
-use crate::network::binance::binance_client::fetch_historical_candles_with_testnet;
-use crate::network::binance::binance_kline_client::{run_binance_kline_client, seconds_to_kline_interval};
-use crate::network::binance::binance_websocket_client::run_binance_websocket_client;
-use crate::network::binance::binance_depth_client::run_binance_depth_client;
-use crate::network::binance::book_ticker_client::run_book_ticker_client;
-use crate::network::binance::exchange_info::fetch_symbol_filters;
-use crate::network::binance::fear_greed::fetch_fear_greed_index;
-use crate::risk::kill_switch::{KillSwitch, run_control_server};
-use crate::risk::risk_manager::RiskManager;
-use crate::strategy::spot_strategy::SpotStrategy;
-use crate::metrics::{BotMetrics, SymbolSnapshot, update_metrics, run_metrics_server};
-use crate::dashboard::server::{DashboardState, PositionInfo, run_dashboard_server};
-use crate::utility::walk_forward::{run_walk_forward, print_walk_forward_report};
+use RustBot::alerts::telegram;
+use RustBot::logs::csv::write_to_csv_file;
+use RustBot::logs::json::write_to_jsonl_file;
+use RustBot::models::bot_config::BotConfig;
+use RustBot::models::candle::Candle;
+use RustBot::models::candle_log_entry::CandleLogEntry;
+use RustBot::models::data::{BacktestResult, Mode};
+use RustBot::network::binance::binance_client::fetch_historical_candles_with_testnet;
+use RustBot::network::binance::binance_kline_client::{run_binance_kline_client, seconds_to_kline_interval};
+use RustBot::network::binance::binance_websocket_client::run_binance_websocket_client;
+use RustBot::network::binance::binance_depth_client::run_binance_depth_client;
+use RustBot::network::binance::book_ticker_client::run_book_ticker_client;
+use RustBot::network::binance::exchange_info::fetch_symbol_filters;
+use RustBot::network::binance::fear_greed::fetch_fear_greed_index;
+use RustBot::risk::kill_switch::{KillSwitch, run_control_server};
+use RustBot::risk::risk_manager::RiskManager;
+use RustBot::strategy::spot_strategy::SpotStrategy;
+use RustBot::metrics::{BotMetrics, SymbolSnapshot, update_metrics, run_metrics_server};
+use RustBot::dashboard::server::{DashboardState, PositionInfo, run_dashboard_server};
+use RustBot::utility::walk_forward::{run_walk_forward, print_walk_forward_report};
 
 use csv::ReaderBuilder;
 use reqwest::Client;
 use std::error::Error;
 use std::path::Path;
 use tokio::sync::mpsc;
-use crate::models::log_level::LogLevel;
-use crate::network::scanner::get_top_volume_pairs;
-use crate::strategy::TradingStrategy;
+use RustBot::models::log_level::LogLevel;
+use RustBot::network::scanner::get_top_volume_pairs;
+use RustBot::strategy::TradingStrategy;
 
-use crate::execution::{ExecutionBroker, OrderRequest, OrderSide, OrderType, ClientOrderId, OrderAck};
-use crate::execution::state::PositionState;
-use crate::network::binance::user_data_stream::UserDataStream;
-use tokio::sync::broadcast;
+use RustBot::execution::{ExecutionBroker, OrderRequest, OrderSide, OrderType, ClientOrderId, OrderAck};
+use RustBot::execution::state::PositionState;
 
 // ── History download ──────────────────────────────────────────────────────────
 
@@ -126,29 +111,133 @@ fn load_candles_from_csv(file_path: &str) -> Result<Vec<Candle>, Box<dyn Error>>
     Ok(candles)
 }
 
+/// Buffer between a protective stop's trigger price and its resting limit
+/// price, so the STOP_LOSS_LIMIT order stays marketable once triggered
+/// instead of sitting unfilled past the stop level in a fast move.
+const STOP_LIMIT_BUFFER_PCT: f64 = 0.005;
+
+/// Minimum trailing-stop move (as a fraction of price) before we bother
+/// cancelling and replacing the resting exchange-side stop order. `on_tick`
+/// fires on every price update, so without this threshold a trailing stop
+/// would cancel/replace on almost every tick and burn through Binance's
+/// order rate limit.
+const STOP_REPLACE_THRESHOLD_PCT: f64 = 0.002;
+
+/// Round `value` to the nearest multiple of `tick`. Binance's PRICE_FILTER
+/// rejects any price that isn't an exact multiple of the symbol's tick size
+/// (e.g. 0.01 for BTCUSDT) — a raw `price * (1 ± buffer)` computation has
+/// far more decimal digits than that and gets rejected with `-1013 Filter
+/// failure: PRICE_FILTER` every time. `tick <= 0.0` (filters not loaded)
+/// falls back to returning the value unrounded rather than dividing by zero.
+fn round_to_tick(value: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return value;
+    }
+    (value / tick).round() * tick
+}
+
+/// Place (or replace) the exchange-side protective STOP_LOSS_LIMIT order for
+/// `state`. Returns the new order's `client_id` on success so the caller can
+/// persist it on the position row.
+///
+/// Long position → SELL stop below price. Short position → BUY stop above
+/// price (only reachable once real margin/futures shorting is wired up;
+/// spot shorts are disabled in config today). `tick_size` is the symbol's
+/// price filter tick from `exchangeInfo` — pass `0.0` only if it's
+/// genuinely unavailable (this skips rounding and risks a PRICE_FILTER
+/// rejection, so avoid it whenever `SymbolFilters` has already been fetched).
+async fn place_protective_stop(
+    broker: &Arc<dyn ExecutionBroker>,
+    symbol: &str,
+    state: &PositionState,
+    tick_size: f64,
+) -> Result<String, String> {
+    // `trailing_stop_price` only gets set once the strategy has tightened
+    // the stop past its initial level — a fresh entry (or one recovered via
+    // reconciliation before the first trail update) reports it as 0. Fall
+    // back to `initial_stop_price`, the ATR-based stop fixed at entry.
+    let raw_stop_price = if state.trailing_stop_price > 0.0 {
+        state.trailing_stop_price
+    } else {
+        state.initial_stop_price
+    };
+    if raw_stop_price <= 0.0 || state.qty <= 0.0 {
+        return Err(format!(
+            "invalid stop inputs (trailing={:.8}, initial={:.8}, qty={:.8})",
+            state.trailing_stop_price, state.initial_stop_price, state.qty
+        ));
+    }
+
+    let (side, raw_limit_price) = if state.is_short {
+        (OrderSide::Buy, raw_stop_price * (1.0 + STOP_LIMIT_BUFFER_PCT))
+    } else {
+        (OrderSide::Sell, raw_stop_price * (1.0 - STOP_LIMIT_BUFFER_PCT))
+    };
+    let stop_price = round_to_tick(raw_stop_price, tick_size);
+    let limit_price = round_to_tick(raw_limit_price, tick_size);
+
+    let client_id = ClientOrderId::new(symbol, side);
+    let req = OrderRequest {
+        symbol: symbol.to_string(),
+        client_id: client_id.clone(),
+        side,
+        order_type: OrderType::StopLossLimit,
+        qty: state.qty,
+        price: Some(limit_price),
+        stop_price: Some(stop_price),
+    };
+
+    match broker.place_order(req).await {
+        Ok(ack) => {
+            println!(
+                "[EXECUTION] Placed protective stop for {}: {:?} {:.8} @ stop {:.8} (limit {:.8})",
+                symbol, side, state.qty, stop_price, limit_price
+            );
+            Ok(ack.client_id.0)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Cancel a previously-placed resting stop order. Failure is logged, not
+/// propagated — the order may already be gone (filled by the exchange, or
+/// cancelled in a prior run) and that must never block the market order that
+/// follows a cancel-then-replace sequence.
+async fn cancel_resting_stop(broker: &Arc<dyn ExecutionBroker>, symbol: &str, stop_order_id: &str) {
+    let id = ClientOrderId(stop_order_id.to_string());
+    if let Err(e) = broker.cancel(symbol, &id).await {
+        eprintln!(
+            "[EXECUTION] Cancel of resting stop {} for {} failed (may already be filled/gone): {}",
+            stop_order_id, symbol, e
+        );
+    }
+}
+
 async fn sync_broker_state(
     symbol: &str,
     old_state: &Option<PositionState>,
     new_state: &Option<PositionState>,
     broker: &Arc<dyn ExecutionBroker>,
     state_manager: &StateManager,
+    tick_size: f64,
 ) {
     if old_state == new_state {
         return; // No change
     }
 
-    // 1. Save to SQLite
-    if let Some(ref s) = new_state {
-        if let Err(e) = state_manager.save_position(s) {
-            eprintln!("[ERROR] Failed to save state to SQLite: {}", e);
-        }
-    } else {
-        if let Err(e) = state_manager.delete_position(symbol) {
-            eprintln!("[ERROR] Failed to delete state from SQLite: {}", e);
-        }
-    }
+    // PaperBroker fills every order immediately, including "stop" orders —
+    // see `PaperBroker::place_order`. Placing a resting protective stop
+    // there would instantly close the paper position, so exchange-side
+    // stops only make sense against a real broker.
+    let use_exchange_stops = broker.name() != "PaperBroker";
 
-    // 2. Execute mirror trades on broker
+    // `strategy.get_position_state()` never knows about broker-side order
+    // ids (see the `stop_order_id` doc comment on `PositionState`), so the
+    // only place that remembers the currently-resting stop is what we
+    // persisted last time. Load it before we overwrite anything.
+    let persisted_old = state_manager.load_position(symbol).await.ok().flatten();
+    let old_stop_order_id = persisted_old.and_then(|p| p.stop_order_id);
+
     let old_qty = old_state.as_ref().map(|s| {
         if s.is_holding { s.qty } else if s.is_short { -s.qty } else { 0.0 }
     }).unwrap_or(0.0);
@@ -158,8 +247,23 @@ async fn sync_broker_state(
     }).unwrap_or(0.0);
 
     let delta = new_qty - old_qty;
-    
+
+    // The state we'll actually persist — enriched with whatever stop order
+    // id results from the actions below (strategy-reported `new_state` never
+    // carries one).
+    let mut to_persist = new_state.clone();
+
     if delta.abs() > 0.00000001 {
+        // Position size is changing: opening, closing, or flipping side.
+        // Any resting stop from the *previous* position is now wrong (wrong
+        // side, wrong qty, or the position it protected no longer exists)
+        // and must go before we touch the market position.
+        if use_exchange_stops && old_qty.abs() > 0.00000001 {
+            if let Some(id) = old_stop_order_id.as_deref() {
+                cancel_resting_stop(broker, symbol, id).await;
+            }
+        }
+
         let side = if delta > 0.0 { OrderSide::Buy } else { OrderSide::Sell };
         let req = OrderRequest {
             symbol: symbol.to_string(),
@@ -170,17 +274,70 @@ async fn sync_broker_state(
             price: None,
             stop_price: None,
         };
-        
+
         println!("[EXECUTION] Mirroring strategy state: {:?} {:.8} {}", side, delta.abs(), symbol);
         match broker.place_order(req).await {
             Ok(ack) => {
                 println!("[EXECUTION] Successfully mirrored. Avg Price: {:.2}, Filled: {:.8}", ack.avg_price, ack.filled_qty);
+
+                // Position is now open (or flipped) — plant a fresh
+                // exchange-side stop so it's protected even if this process
+                // dies before the next tick.
+                if use_exchange_stops {
+                    if let Some(ref mut ns) = to_persist {
+                        match place_protective_stop(broker, symbol, ns, tick_size).await {
+                            Ok(stop_id) => ns.stop_order_id = Some(stop_id),
+                            Err(e) => {
+                                eprintln!("[EXECUTION-ERROR] No exchange-side stop for {}: {}", symbol, e);
+                                let _ = telegram::alert_critical(
+                                    "STOP_ORDER_FAILED",
+                                    &format!("{} is open with NO exchange-side protective stop: {}", symbol, e),
+                                ).await;
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("[EXECUTION-ERROR] Failed to mirror trade on {}: {}", symbol, e);
                 let _ = telegram::alert_critical("EXECUTION_FAILED", &format!("Failed to execute {} on {}: {}", delta, symbol, e)).await;
             }
         }
+    } else if use_exchange_stops {
+        // No size change — check whether the trailing stop moved far enough
+        // to be worth cancelling and replacing the resting order.
+        if let (Some(os), Some(ref mut ns)) = (old_state.as_ref(), to_persist.as_mut()) {
+            let ref_price = os.trailing_stop_price.max(ns.trailing_stop_price).max(1e-9);
+            let moved_pct = (os.trailing_stop_price - ns.trailing_stop_price).abs() / ref_price;
+
+            if moved_pct > STOP_REPLACE_THRESHOLD_PCT {
+                if let Some(id) = old_stop_order_id.as_deref() {
+                    cancel_resting_stop(broker, symbol, id).await;
+                }
+                match place_protective_stop(broker, symbol, ns, tick_size).await {
+                    Ok(stop_id) => ns.stop_order_id = Some(stop_id),
+                    Err(e) => {
+                        eprintln!("[EXECUTION-ERROR] Failed to replace trailing stop for {}: {}", symbol, e);
+                        // Keep the old id rather than silently dropping protection —
+                        // it may still be resting on the exchange at the old level.
+                        ns.stop_order_id = old_stop_order_id.clone();
+                    }
+                }
+            } else {
+                // Stop didn't move enough to replace — carry the existing
+                // resting order id forward so we don't lose track of it.
+                ns.stop_order_id = old_stop_order_id.clone();
+            }
+        }
+    }
+
+    // Persist the final state (including whatever stop_order_id resulted above).
+    if let Some(s) = to_persist.as_ref() {
+        if let Err(e) = state_manager.save_position(s).await {
+            eprintln!("[ERROR] Failed to save state to SQLite: {}", e);
+        }
+    } else if let Err(e) = state_manager.delete_position(symbol).await {
+        eprintln!("[ERROR] Failed to delete state from SQLite: {}", e);
     }
 }
 
@@ -496,33 +653,9 @@ async fn main() {
         }
     }
 
-    let state_manager = StateManager::new("atlas_state.db").expect("Failed to init SQLite DB");
-
-    /*
-    // USER DATA STREAM DEPRECATED
-    // Binance officially discontinued the legacy userDataStream listenKey system on February 20, 2026.
-    // The bot's core execution does not rely on this (it uses sync broker.place_order),
-    // so we disable it to prevent 410 Gone errors on Testnet/Mainnet.
-    if let Ok(api_key) = std::env::var("BINANCE_API_KEY") {
-        let (uds_tx, mut uds_rx) = broadcast::channel::<OrderAck>(100);
-        let uds = UserDataStream::new(api_key, use_testnet);
-        tokio::spawn(async move {
-            uds.run(uds_tx).await;
-        });
-
-        tokio::spawn(async move {
-            while let Ok(ack) = uds_rx.recv().await {
-                println!("[EXCHANGE] Execution Report: {} {} {:.8} @ {:.2} (Status: {:?})",
-                    ack.symbol, 
-                    if ack.side == OrderSide::Buy { "BUY" } else { "SELL" },
-                    ack.filled_qty, 
-                    ack.avg_price, 
-                    ack.status
-                );
-            }
-        });
-    }
-    */
+    let state_manager = StateManager::new("atlas_state.db")
+        .await
+        .expect("Failed to init SQLite DB");
 
     // ── Warm-up: paginated history + real exchangeInfo filters ────────────────
     let live_capital_by_symbol = config.allocate_capital(&best_live_symbols, config.margin);
@@ -537,13 +670,43 @@ async fn main() {
 
         let symbol_filters = fetch_symbol_filters(sym, &client, use_testnet).await;
 
-        let reconciled_state = match reconcile_startup(&broker, &state_manager, &config).await {
+        let mut reconciled_state = match reconcile_startup(sym, &broker, &state_manager, &config).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[ERROR] Reconciliation failed for {}: {}", sym, e);
                 continue;
             }
         };
+
+        // A position confirmed by reconciliation but with no resting stop
+        // (fresh row from before this stop-order logic existed, or the
+        // process died between market entry and placing the stop, or the
+        // recorded stop turned out to be gone — see `reconcile_startup`)
+        // must not enter the live loop unprotected: `sync_broker_state`
+        // only places/replaces a stop on a *change* of position state, and
+        // a recovered position that just sits there may never see one.
+        if broker.name() != "PaperBroker" {
+            let tick_size = symbol_filters.as_ref().map(|f| f.tick_size).unwrap_or(0.01);
+            if let Some(ref mut state) = reconciled_state {
+                if (state.is_holding || state.is_short) && state.stop_order_id.is_none() {
+                    match place_protective_stop(&broker, sym, state, tick_size).await {
+                        Ok(stop_id) => {
+                            state.stop_order_id = Some(stop_id);
+                            if let Err(e) = state_manager.save_position(state).await {
+                                eprintln!("[ERROR] Failed to persist recovered stop for {}: {}", sym, e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[EXECUTION-ERROR] {} recovered with an open position and NO exchange-side stop: {}", sym, e);
+                            let _ = telegram::alert_critical(
+                                "STOP_ORDER_FAILED",
+                                &format!("{} recovered at boot with NO exchange-side protective stop: {}", sym, e),
+                            ).await;
+                        }
+                    }
+                }
+            }
+        }
 
         let mut strategy: Box<dyn TradingStrategy> = Box::new(SpotStrategy::new(
             capital_per_symbol, sym, log_tx.clone(),
@@ -720,14 +883,17 @@ async fn main() {
                     strategy.on_candle_close(&candle);
                     
                     let new_state = strategy.get_position_state();
-                    
-                    sync_broker_state(&sym, &old_state, &new_state, &broker, &state_manager).await;
-                    
+
+                    let tick_size = strategy.as_any().downcast_ref::<SpotStrategy>()
+                        .map(|s| s.wallet.filters.tick_size)
+                        .unwrap_or(0.01);
+                    sync_broker_state(&sym, &old_state, &new_state, &broker, &state_manager, tick_size).await;
+
                     if let Some(spot) = strategy.as_any().downcast_ref::<SpotStrategy>() {
-                        if spot.drawdown_stop_active && spot.is_holding_asset {
+                        if spot.reporter.drawdown_stop_active && spot.position.is_holding_asset {
                             let reason = format!(
                                 "{} drawdown halt triggered. Equity: ${:.2}",
-                                sym, spot.current_equity
+                                sym, spot.reporter.current_equity
                             );
                             ks.halt(&reason).await;
                             telegram::alert_critical("DRAWDOWN_HALT", &reason).await;
@@ -784,8 +950,11 @@ async fn main() {
                     let old_state = strategy.get_position_state();
                     strategy.on_tick(price);
                     let new_state = strategy.get_position_state();
-                    
-                    sync_broker_state(&sym, &old_state, &new_state, &broker, &state_manager).await;
+
+                    let tick_size = strategy.as_any().downcast_ref::<SpotStrategy>()
+                        .map(|s| s.wallet.filters.tick_size)
+                        .unwrap_or(0.01);
+                    sync_broker_state(&sym, &old_state, &new_state, &broker, &state_manager, tick_size).await;
                 }
                 broadcast_dashboard(&strategies, &current_prices, config.margin, &risk_manager, &ks, &dash_tx);
             }
@@ -836,13 +1005,13 @@ fn broadcast_dashboard(
         
         if let Some(spot) = strategy.as_any().downcast_ref::<SpotStrategy>() {
             total_daily_pnl += spot.daily_pnl;
-            total_trades_all += spot.trade_history.len() as u32;
-            total_wins_all += spot.trade_history.iter().filter(|t| t.pnl_pct > 0.0).count() as u32;
-            fg_index = spot.fear_greed_index; // Take from any strategy
+            total_trades_all += spot.reporter.trade_history.len() as u32;
+            total_wins_all += spot.reporter.trade_history.iter().filter(|t| t.pnl_pct > 0.0).count() as u32;
+            fg_index = spot.entry_filters.fear_greed_index; // Take from any strategy
 
-            if spot.is_holding_asset {
+            if spot.position.is_holding_asset {
                 let qty = spot.wallet.crypto_balance;
-                let entry = spot.buy_price;
+                let entry = spot.position.buy_price;
                 let unrealized_pnl = (current_price - entry) * qty;
                 let unrealized_pnl_pct = if entry > 0.0 { (current_price - entry) / entry * 100.0 } else { 0.0 };
                 open_positions.push(PositionInfo {

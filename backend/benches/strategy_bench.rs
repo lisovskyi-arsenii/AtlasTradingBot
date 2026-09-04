@@ -9,7 +9,6 @@
 //! HTML reports are generated in `target/criterion/`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use tokio::runtime::Runtime;
 
 // Re-use the bot's modules
 use RustBot::models::candle::Candle;
@@ -17,27 +16,38 @@ use RustBot::models::data::CryptoExchange;
 use RustBot::models::log_level::LogLevel;
 use RustBot::models::strategy_config::StrategyConfig;
 use RustBot::strategy::spot_strategy::SpotStrategy;
+use RustBot::strategy::TradingStrategy;
 
 /// Generate a synthetic candle sequence for benchmarking.
 fn synthetic_candles(n: usize) -> Vec<Candle> {
     let mut price = 50_000.0f64;
     let mut candles = Vec::with_capacity(n);
 
-    // Simple random walk
+    // Simple random walk. `high`/`low` are derived from `open`/`close` (not
+    // independently offset from `price`) so low <= open,close <= high always
+    // holds — `ta::DataItem::builder().build()` rejects any bar that
+    // violates that invariant, which an earlier version of this generator
+    // could produce (open computed from `change` while high/low were offset
+    // from `price` by unrelated random terms).
     let mut seed = 42u64;
     for _ in 0..n {
         // LCG pseudo-random
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let change = ((seed >> 33) as f64 / u32::MAX as f64 - 0.5) * 100.0;
+        let open = price;
         price = (price + change).max(1.0);
+        let close = price;
 
-        let high = price + (((seed >> 16) as f64 / u32::MAX as f64) * 50.0);
-        let low  = price - (((seed >>  8) as f64 / u32::MAX as f64) * 50.0);
+        let wick_up = ((seed >> 16) as f64 / u32::MAX as f64) * 50.0;
+        let wick_down = ((seed >> 8) as f64 / u32::MAX as f64) * 50.0;
+        let high = open.max(close) + wick_up;
+        let low = (open.min(close) - wick_down).max(0.01);
+
         candles.push(Candle {
-            open: price - change,
+            open,
             high,
             low,
-            close: price,
+            close,
             volume: ((seed & 0xFFFF) as f64) + 100.0,
         });
     }
